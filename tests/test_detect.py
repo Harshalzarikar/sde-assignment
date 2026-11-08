@@ -52,14 +52,14 @@ def _workflow() -> dict:
     }
 
 
-def _config() -> dict:
+def _config(caller: dict | None = None) -> dict:
     return {
         "cohorts": [],
         "allocations": {
             "default": {
                 "welcome_message": {"W1": 1.0},
                 "voice": {"V1": 1.0},
-                "caller_id": {"D1": 0.45, "D2": 0.45, "D3": 0.10},
+                "caller_id": caller or {"D1": 0.45, "D2": 0.45, "D3": 0.10},
             }
         },
         "prompt_version": "P1",
@@ -148,9 +148,9 @@ def _add_hour(
     store: Store,
     hour: datetime,
     d3_connected: int,
-    d3_dials: int = 60,
-    others_connected: int = 36,
-    others_dials: int = 60,
+    d3_dials: int = 500,
+    others_connected: int = 300,
+    others_dials: int = 500,
 ) -> None:
     for caller_id in ("D1", "D2"):
         _add_counts(store, caller_id, hour, others_dials, others_connected)
@@ -159,13 +159,15 @@ def _add_hour(
 
 def _seed_baseline(store: Store) -> None:
     for offset in (3, 4):
-        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=36)
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=300)
 
 
 def _detector(
-    store: Store, workflow: dict | None = None
+    store: Store,
+    workflow: dict | None = None,
+    config: dict | None = None,
 ) -> tuple[CallerIdHealthDetector, FakeClient]:
-    client = FakeClient(workflow or _workflow(), _config())
+    client = FakeClient(workflow or _workflow(), config or _config())
     governance = GovernanceClient(client, store, log=lambda message: None)
     detector = CallerIdHealthDetector(
         client, store, governance, DETECTOR_CONFIG, log=lambda message: None
@@ -181,7 +183,7 @@ def test_healthy_caller_takes_no_action(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
     for offset in (1, 2):
-        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=36)
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=300)
     detector, client = _detector(store)
 
     actions = detector.tick(T0.isoformat())
@@ -196,7 +198,7 @@ def test_clear_bad_caller_shifts_to_exploration_share(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
     for offset in (1, 2):
-        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=6)
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=50)
     detector, client = _detector(store)
 
     actions = detector.tick(T0.isoformat())
@@ -217,8 +219,8 @@ def test_clear_bad_caller_shifts_to_exploration_share(tmp_path):
 def test_single_hour_blip_takes_no_action(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
-    _add_hour(store, T0 - timedelta(hours=1), d3_connected=36)
-    _add_hour(store, T0 - timedelta(hours=2), d3_connected=6)
+    _add_hour(store, T0 - timedelta(hours=1), d3_connected=300)
+    _add_hour(store, T0 - timedelta(hours=2), d3_connected=50)
     detector, client = _detector(store)
 
     actions = detector.tick(T0.isoformat())
@@ -247,11 +249,74 @@ def test_small_sample_takes_no_action(tmp_path):
     store.close()
 
 
+def test_exploration_share_scales_with_volume_to_keep_min_dials(tmp_path):
+    store = Store(tmp_path / "store.db")
+    for offset in (3, 4):
+        for caller_id in ("D1", "D2", "D3"):
+            _add_counts(store, caller_id, T0 - timedelta(hours=offset), 100, 60)
+    for offset in (1, 2):
+        for caller_id in ("D1", "D2"):
+            _add_counts(store, caller_id, T0 - timedelta(hours=offset), 100, 60)
+        _add_counts(store, "D3", T0 - timedelta(hours=offset), 100, 10)
+    detector, client = _detector(
+        store, config=_config({"D1": 0.25, "D2": 0.25, "D3": 0.50})
+    )
+
+    actions = detector.tick(T0.isoformat())
+
+    assert actions[0]["status"] == "applied"
+    expected_share = DETECTOR_CONFIG.min_dials / 300.0
+    assert abs(_weights(client)["D3"] - expected_share) < 1e-9
+    assert expected_share > DETECTOR_CONFIG.exploration_share
+    store.close()
+
+
+def test_shift_over_max_shift_routes_to_approval_not_put(tmp_path):
+    store = Store(tmp_path / "store.db")
+    _seed_baseline(store)
+    for offset in (1, 2):
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=50)
+    workflow = _workflow()
+    workflow["governance"]["auto_apply"]["max_shift"] = 0.20
+    detector, client = _detector(
+        store, workflow, _config({"D1": 0.25, "D2": 0.25, "D3": 0.50})
+    )
+
+    actions = detector.tick(T0.isoformat())
+
+    assert len(actions) == 1
+    assert actions[0]["status"] == "pending"
+    assert client.put_calls == []
+    assert len(client.request_calls) == 1
+    store.close()
+
+
+def test_single_caller_logs_once(tmp_path):
+    store = Store(tmp_path / "store.db")
+    client = FakeClient(_workflow(), _config({"D1": 1.0}))
+    governance = GovernanceClient(client, store, log=lambda message: None)
+    messages: list[str] = []
+    detector = CallerIdHealthDetector(
+        client, store, governance, DETECTOR_CONFIG, log=messages.append
+    )
+
+    detector.tick(T0.isoformat())
+    detector.tick((T0 + timedelta(minutes=15)).isoformat())
+
+    matches = [
+        message
+        for message in messages
+        if "no alternative caller_id to compare" in message
+    ]
+    assert len(matches) == 1
+    store.close()
+
+
 def test_disabled_auto_apply_routes_fix_through_approval(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
     for offset in (1, 2):
-        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=6)
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=50)
     workflow = _workflow()
     workflow["governance"]["auto_apply"] = {
         "enabled": False,
@@ -273,7 +338,7 @@ def test_recovery_raises_weight_after_consecutive_windows(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
     for offset in (1, 2):
-        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=6)
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=50)
     detector, client = _detector(store)
 
     actions = detector.tick(T0.isoformat())

@@ -158,8 +158,13 @@ class CallerIdHealthDetector:
         recent_start, recent_end = windows[0][0], windows[-1][1]
         recent = self._totals(workflow_id, recent_start, recent_end)
 
+        current_callers = self._current_callers(config)
+        if len(current_callers) < 2:
+            self._log_single_caller_once(workflow_id)
+            return []
+
         actions: list[dict[str, Any]] = []
-        for caller_id in sorted(self._current_callers(config)):
+        for caller_id in sorted(current_callers):
             state = self._load_state(workflow_id, caller_id)
             if state is not None:
                 state = self._refresh_state(workflow_id, caller_id, state, sim_ts)
@@ -322,6 +327,13 @@ class CallerIdHealthDetector:
                 callers.update(str(key) for key in distribution)
         return callers
 
+    def _log_single_caller_once(self, workflow_id: str) -> None:
+        key = f"caller_health_single_id_logged:{workflow_id}"
+        if self.store.get_meta(key):
+            return
+        self.log(f"[detect] {workflow_id}: no alternative caller_id to compare")
+        self.store.set_meta(key, "1")
+
     def _fix(
         self,
         workflow: dict[str, Any],
@@ -332,7 +344,8 @@ class CallerIdHealthDetector:
         recent: dict[str, dict[str, int]],
         sim_ts: str,
     ) -> dict[str, Any] | None:
-        new_config, info = self._reduce_config(config, caller_id)
+        target_share = self._exploration_share(recent)
+        new_config, info = self._reduce_config(config, caller_id, target_share)
         if new_config is None:
             return None
         allowed, reason = self._guardrail_gate(
@@ -601,8 +614,19 @@ class CallerIdHealthDetector:
             }
         return diff
 
+    def _exploration_share(self, recent: dict[str, dict[str, int]]) -> float:
+        # Keep enough expected dials in each window to clear MIN_DIALS after the
+        # cut. If that requires a large reduction, _apply routes the change through
+        # /approvals rather than issuing a PUT that would exceed max_shift.
+        total_dials = sum(item["dials"] for item in recent.values())
+        per_window = total_dials / max(1, self.config.windows_required)
+        if per_window <= 0:
+            return self.config.exploration_share
+        required = self.config.min_dials / per_window
+        return min(1.0, max(self.config.exploration_share, required))
+
     def _reduce_config(
-        self, config: dict[str, Any], caller_id: str
+        self, config: dict[str, Any], caller_id: str, target_share: float
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         new_config = copy.deepcopy(config)
         original_shares: dict[str, float] = {}
@@ -612,9 +636,9 @@ class CallerIdHealthDetector:
             if total <= 0 or caller_id not in distribution:
                 continue
             current = float(distribution[caller_id]) / total
-            if current <= self.config.exploration_share + 1e-9:
+            if current <= target_share + 1e-9:
                 continue
-            target_weight = self.config.exploration_share * total
+            target_weight = target_share * total
             removed = float(distribution[caller_id]) - target_weight
             others = {
                 name: float(weight)
@@ -632,13 +656,12 @@ class CallerIdHealthDetector:
         if not changed_keys:
             return None, None
         default_key = "default" if "default" in original_shares else changed_keys[0]
-        removed_fraction = (
-            original_shares[default_key] - self.config.exploration_share
-        )
+        removed_fraction = original_shares[default_key] - target_share
         return new_config, {
             "original_shares": original_shares,
             "changed_keys": changed_keys,
             "removed_fraction": removed_fraction,
+            "target_share": target_share,
         }
 
     def _raise_config(
