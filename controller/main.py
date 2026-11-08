@@ -78,9 +78,10 @@ def _log_ingest(
     count = sum(ingested.values())
     rate = count / elapsed if elapsed > 0 else 0.0
     by_kind = ",".join(f"{kind}:{n}" for kind, n in sorted(ingested.items())) or "none"
+    lag = _lag_text(state.get("ts"), store.last_event_ts()) if count else "n/a"
     print(
         f"[ingest:{label}] sim={state.get('ts')} chunks={by_kind} events={count} "
-        f"events_per_sec={rate:.0f} lag={_lag_text(state.get('ts'), store.last_event_ts())}",
+        f"events_per_sec={rate:.0f} lag={lag}",
         flush=True,
     )
 

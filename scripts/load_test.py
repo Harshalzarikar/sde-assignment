@@ -200,6 +200,10 @@ def _run_controller(
     return int(process.returncode), elapsed, peak_mb or None
 
 
+def _lag_text(seconds: object) -> str:
+    return "n/a" if seconds is None else f"{float(seconds):.1f} s"
+
+
 def _parse_log(path: Path) -> dict[str, object]:
     ingest = []
     tick_durations = []
@@ -222,14 +226,17 @@ def _parse_log(path: Path) -> dict[str, object]:
         if match:
             tick_durations.append(float(match.group("duration")))
     tick_rows = [row for row in ingest if row["label"] == "tick"]
+    event_tick_rows = [row for row in tick_rows if int(row["events"]) > 0]
     lag_values = [
         float(row["lag_seconds"])
-        for row in tick_rows
+        for row in event_tick_rows
         if row["lag_seconds"] is not None
     ]
     return {
         "ingest": ingest,
         "tick_events": sum(int(row["events"]) for row in tick_rows),
+        "event_tick_count": len(event_tick_rows),
+        "idle_tick_count": len(tick_rows) - len(event_tick_rows),
         "tick_rates": [float(row["rate"]) for row in tick_rows],
         "tick_durations": tick_durations,
         "max_lag_seconds": max(lag_values) if lag_values else None,
@@ -289,8 +296,10 @@ def _write_report(
         f"| Peak per-tick ingest rate | {metrics['peak_tick_rate']:.0f} events/s |",
         f"| Mean tick duration | {metrics['mean_tick_seconds'] * 1000:.2f} ms |",
         f"| Slowest tick duration | {metrics['slowest_tick_seconds'] * 1000:.2f} ms |",
-        f"| Max ingest lag | {metrics['max_lag_seconds']} s |",
-        f"| Final ingest lag | {metrics['final_lag_seconds']} s |",
+        f"| Event-ingesting ticks | {metrics['event_tick_count']} |",
+        f"| Idle ticks | {metrics['idle_tick_count']} |",
+        f"| Max ingest lag (event ticks) | {_lag_text(metrics['max_lag_seconds'])} |",
+        f"| Final ingest lag (event ticks) | {_lag_text(metrics['final_lag_seconds'])} |",
         f"| Peak controller working set | {metrics['peak_memory_mb']:.1f} MB |",
         f"| Final DB size | {metrics['db_size_mb']:.1f} MB |",
         f"| Simulated finish | minute {state.get('sim_minute')} of {state.get('end_minute')} |",
@@ -414,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
             sum(tick_durations) / len(tick_durations) if tick_durations else 0.0
         ),
         "slowest_tick_seconds": max(tick_durations) if tick_durations else 0.0,
+        "event_tick_count": parsed["event_tick_count"],
+        "idle_tick_count": parsed["idle_tick_count"],
         "max_lag_seconds": parsed["max_lag_seconds"],
         "final_lag_seconds": parsed["final_lag_seconds"],
         "peak_memory_mb": peak_mb or 0.0,
