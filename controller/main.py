@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from .client import ScenarioFinished, SimClient
+from .detect import CallerIdHealthDetector
 from .governance import GovernanceClient
 from .ingest import ingest_new_chunks
 from .store import Store, open_store
@@ -85,10 +86,17 @@ def _log_ingest(
 
 
 def decide(
-    client: SimClient, store: Store, workflows: list[dict[str, Any]], sim_ts: str
+    client: SimClient,
+    store: Store,
+    workflows: list[dict[str, Any]],
+    sim_ts: str,
+    governance: GovernanceClient | None = None,
 ) -> None:
-    """Decision hook; detection and governance are added in later tasks."""
-    return None
+    governance = governance or GovernanceClient(client, store)
+    detector = CallerIdHealthDetector(client, store, governance)
+    detector.tick(
+        sim_ts, workflow_ids=[str(item["workflow_id"]) for item in workflows]
+    )
 
 
 def _hourly_summary(
@@ -150,7 +158,7 @@ def run(
             _report_event_ranges(client, store)
             live_range_seen = True
 
-        decide(client, store, workflows, state.get("ts", ""))
+        decide(client, store, workflows, state.get("ts", ""), governance=governance)
         governance.process(sim_ts=state.get("ts"))
 
         if int(state.get("sim_minute", 0)) % 60 == 0:
