@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from .client import ScenarioFinished, SimClient
+from .governance import GovernanceClient
 from .ingest import ingest_new_chunks
 from .store import Store, open_store
 
@@ -126,6 +127,9 @@ def run(
     ingested, elapsed = _timed_ingest(client, store, "startup")
     _log_ingest("startup", ingested, elapsed, state, store)
 
+    governance = GovernanceClient(client, store)
+    governance.reconcile_all(sim_ts=state.get("ts"))
+
     while True:
         state = client.get_state()
         if state.get("finished"):
@@ -147,6 +151,7 @@ def run(
             live_range_seen = True
 
         decide(client, store, workflows, state.get("ts", ""))
+        governance.process(sim_ts=state.get("ts"))
 
         if int(state.get("sim_minute", 0)) % 60 == 0:
             _hourly_summary(store, workflows, state.get("ts"))
