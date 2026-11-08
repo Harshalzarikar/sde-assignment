@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta
+import json
 
 from controller.detect import CallerIdHealthDetector, DetectorConfig
 from controller.governance import GovernanceClient
@@ -191,6 +192,37 @@ def test_healthy_caller_takes_no_action(tmp_path):
     assert actions == []
     assert client.put_calls == []
     assert _weights(client)["D3"] == 0.10
+    store.close()
+
+
+def test_daily_no_action_audit_written_once_per_day(tmp_path):
+    store = Store(tmp_path / "store.db")
+    _seed_baseline(store)
+    for offset in (1, 2):
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=300)
+    detector, client = _detector(store)
+
+    detector.tick(T0.isoformat())
+    detector.tick((T0 + timedelta(minutes=15)).isoformat())
+    detector.tick((T0 + timedelta(hours=1)).isoformat())
+    rows = store.conn.execute(
+        "SELECT kind, evidence FROM audit WHERE kind = 'caller_id_daily_check'"
+    ).fetchall()
+    assert len(rows) == 1
+    evidence = json.loads(rows[0][1])
+    assert evidence["decision"] == "no_action"
+    assert evidence["callers_compared"] == ["D1", "D2", "D3"]
+    assert evidence["caller_evidence"][2]["dials"] > 0
+    assert "p_vs_healthy" in evidence["caller_evidence"][2]
+    assert "p_vs_baseline" in evidence["caller_evidence"][2]
+    assert len(evidence["caller_evidence"][2]["windows"]) == 2
+
+    detector.tick((T0 + timedelta(days=1)).isoformat())
+    rows = store.conn.execute(
+        "SELECT COUNT(*) FROM audit WHERE kind = 'caller_id_daily_check'"
+    ).fetchone()
+    assert rows[0] == 2
+    assert client.put_calls == []
     store.close()
 
 

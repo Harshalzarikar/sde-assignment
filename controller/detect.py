@@ -146,6 +146,19 @@ class CallerIdHealthDetector:
         if now is None:
             return []
         if self._reset_cooldown_active(workflow_id, now):
+            self._write_daily_audit(
+                workflow_id,
+                sim_ts,
+                now,
+                decision="no_action",
+                reason="detector is waiting out the supervisor-edit cooldown",
+                callers=[],
+                windows=[],
+                window_totals=[],
+                baseline={},
+                recent={},
+                action_count=0,
+            )
             return []
         workflow = self.client.get_workflow(workflow_id)
         config_record = self.client.get_config(workflow_id)
@@ -155,12 +168,38 @@ class CallerIdHealthDetector:
         if floor is not None:
             windows = [window for window in windows if window[0] >= floor]
             if len(windows) < self.config.windows_required:
+                self._write_daily_audit(
+                    workflow_id,
+                    sim_ts,
+                    now,
+                    decision="no_action",
+                    reason="waiting for enough post-supervisor-edit windows",
+                    callers=[],
+                    windows=windows,
+                    window_totals=[],
+                    baseline={},
+                    recent={},
+                    action_count=0,
+                )
                 return []
         baseline_start = windows[0][0] - timedelta(hours=self.config.baseline_hours)
         baseline_end = windows[0][0]
         if floor is not None:
             baseline_start = max(baseline_start, floor)
         if baseline_end <= baseline_start:
+            self._write_daily_audit(
+                workflow_id,
+                sim_ts,
+                now,
+                decision="no_action",
+                reason="not enough baseline history",
+                callers=[],
+                windows=windows,
+                window_totals=[],
+                baseline={},
+                recent={},
+                action_count=0,
+            )
             return []
         baseline = self._totals(workflow_id, baseline_start, baseline_end)
         window_totals = [
@@ -172,6 +211,19 @@ class CallerIdHealthDetector:
         current_callers = self._current_callers(config)
         if len(current_callers) < 2:
             self._log_single_caller_once(workflow_id)
+            self._write_daily_audit(
+                workflow_id,
+                sim_ts,
+                now,
+                decision="no_action",
+                reason="no alternative caller_id to compare",
+                callers=sorted(current_callers),
+                windows=windows,
+                window_totals=window_totals,
+                baseline=baseline,
+                recent=recent,
+                action_count=0,
+            )
             return []
 
         actions: list[dict[str, Any]] = []
@@ -218,7 +270,173 @@ class CallerIdHealthDetector:
             )
             if action is not None:
                 actions.append(action)
+        self._write_daily_audit(
+            workflow_id,
+            sim_ts,
+            now,
+            decision="no_action" if not actions else "action",
+            reason=(
+                "daily health check found no action"
+                if not actions
+                else "daily health check produced an action"
+            ),
+            callers=sorted(current_callers),
+            windows=windows,
+            window_totals=window_totals,
+            baseline=baseline,
+            recent=recent,
+            action_count=len(actions),
+        )
         return actions
+
+    def _daily_audit_key(self, workflow_id: str, now: datetime) -> str:
+        return f"caller_health_daily_audit:{workflow_id}:{now.date().isoformat()}"
+
+    def _write_daily_audit(
+        self,
+        workflow_id: str,
+        sim_ts: str,
+        now: datetime,
+        *,
+        decision: str,
+        reason: str,
+        callers: list[str],
+        windows: list[tuple[datetime, datetime]],
+        window_totals: list[dict[str, dict[str, int]]],
+        baseline: dict[str, dict[str, int]],
+        recent: dict[str, dict[str, int]],
+        action_count: int,
+    ) -> None:
+        key = self._daily_audit_key(workflow_id, now)
+        if self.store.get_meta(key):
+            return
+        evidence = {
+            "day": now.date().isoformat(),
+            "decision": decision,
+            "action_count": int(action_count),
+            "callers_compared": callers,
+            "caller_evidence": [
+                self._caller_snapshot(
+                    caller_id, window_totals, baseline, recent, windows
+                )
+                for caller_id in callers
+            ],
+            "window_hours": self.config.window_hours,
+            "windows_required": self.config.windows_required,
+            "windows": [
+                {"start": start.isoformat(), "end": end.isoformat()}
+                for start, end in windows
+            ],
+        }
+        self._audit(
+            sim_ts,
+            workflow_id,
+            "caller_id_daily_check",
+            reason,
+            evidence,
+        )
+        self.store.set_meta(key, "1")
+
+    def _caller_snapshot(
+        self,
+        caller_id: str,
+        window_totals: list[dict[str, dict[str, int]]],
+        baseline: dict[str, dict[str, int]],
+        recent: dict[str, dict[str, int]],
+        windows: list[tuple[datetime, datetime]],
+    ) -> dict[str, Any]:
+        empty = {"dials": 0, "connected": 0, "engaged": 0}
+        current = recent.get(caller_id) or empty
+        others = {
+            "dials": sum(item["dials"] for item in recent.values())
+            - current["dials"],
+            "connected": sum(item["connected"] for item in recent.values())
+            - current["connected"],
+            "engaged": sum(item["engaged"] for item in recent.values())
+            - current["engaged"],
+        }
+        base = baseline.get(caller_id) or empty
+        z_healthy, p_healthy = _two_proportion_z(
+            current["connected"],
+            current["dials"],
+            others["connected"],
+            others["dials"],
+        )
+        z_base, p_base = _two_proportion_z(
+            current["connected"],
+            current["dials"],
+            base["connected"],
+            base["dials"],
+        )
+        window_evidence = []
+        for totals, (start, end) in zip(window_totals, windows):
+            item = totals.get(caller_id) or empty
+            peer = {
+                "dials": sum(row["dials"] for row in totals.values())
+                - item["dials"],
+                "connected": sum(row["connected"] for row in totals.values())
+                - item["connected"],
+            }
+            z_window, p_window = _two_proportion_z(
+                item["connected"],
+                item["dials"],
+                peer["connected"],
+                peer["dials"],
+            )
+            z_window_base, p_window_base = _two_proportion_z(
+                item["connected"],
+                item["dials"],
+                base["connected"],
+                base["dials"],
+            )
+            window_evidence.append(
+                {
+                    "window_start": start.isoformat(),
+                    "window_end": end.isoformat(),
+                    "dials": int(item["dials"]),
+                    "connected": int(item["connected"]),
+                    "pickup_rate": round(
+                        item["connected"] / item["dials"], 6
+                    )
+                    if item["dials"]
+                    else None,
+                    "healthy_dials": int(peer["dials"]),
+                    "healthy_pickup_rate": round(
+                        peer["connected"] / peer["dials"], 6
+                    )
+                    if peer["dials"]
+                    else None,
+                    "z_vs_healthy": round(z_window, 6),
+                    "p_vs_healthy": round(p_window, 8),
+                    "z_vs_baseline": round(z_window_base, 6),
+                    "p_vs_baseline": round(p_window_base, 8),
+                }
+            )
+        return {
+            "caller_id": caller_id,
+            "dials": int(current["dials"]),
+            "connected": int(current["connected"]),
+            "pickup_rate": round(current["connected"] / current["dials"], 6)
+            if current["dials"]
+            else None,
+            "healthy_dials": int(others["dials"]),
+            "healthy_pickup_rate": round(
+                others["connected"] / others["dials"], 6
+            )
+            if others["dials"]
+            else None,
+            "baseline_dials": int(base["dials"]),
+            "baseline_pickup_rate": round(
+                base["connected"] / base["dials"], 6
+            )
+            if base["dials"]
+            else None,
+            "z_vs_healthy": round(z_healthy, 6),
+            "p_vs_healthy": round(p_healthy, 8),
+            "z_vs_baseline": round(z_base, 6),
+            "p_vs_baseline": round(p_base, 8),
+            "windows": window_evidence,
+        }
 
     def _windows(self, now: datetime) -> list[tuple[datetime, datetime]]:
         current_hour = now.replace(minute=0, second=0, microsecond=0)
