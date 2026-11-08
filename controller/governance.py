@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import datetime, timedelta
@@ -74,11 +75,13 @@ class GovernanceClient:
         store: Store,
         log: Callable[[str], None] = print,
         queue_lead_minutes: int = 30,
+        detector_reset: Callable[[str, str, int, str], None] | None = None,
     ):
         self.client = client
         self.store = store
         self.log = log
         self.queue_lead_minutes = int(queue_lead_minutes)
+        self.detector_reset = detector_reset
 
     def proposal_id(
         self,
@@ -414,6 +417,97 @@ class GovernanceClient:
         )
         return self.store.get_proposal(proposal_id)
 
+    def _intended_dims(self, proposal: dict[str, Any]) -> set[str]:
+        diff = proposal.get("body", {}).get("diff") or {}
+        text = json.dumps(diff, ensure_ascii=False, sort_keys=True)
+        return {dim for dim in CHANGE_DIMS if dim in text}
+
+    def _merged_config(
+        self,
+        current_config: dict[str, Any],
+        proposed_config: dict[str, Any],
+        intended_dims: set[str],
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(current_config)
+        if intended_dims & set(DISTRIBUTION_DIMS):
+            proposed_alloc = proposed_config.get("allocations") or {}
+            merged_alloc = merged.setdefault("allocations", {})
+            for cohort_id, entry in proposed_alloc.items():
+                if not isinstance(entry, dict):
+                    continue
+                for dim in DISTRIBUTION_DIMS:
+                    if dim in intended_dims and dim in entry:
+                        merged_alloc.setdefault(str(cohort_id), {})[dim] = copy.deepcopy(
+                            entry[dim]
+                        )
+        for dim in ("prompt_version", "schedule", "cohorts"):
+            if dim in intended_dims and dim in proposed_config:
+                merged[dim] = copy.deepcopy(proposed_config[dim])
+        return merged
+
+    def _replan_from_current(
+        self,
+        proposal: dict[str, Any],
+        sim_ts: str,
+        current: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        proposal_id = proposal["proposal_id"]
+        workflow_id = proposal["workflow_id"]
+        intended_dims = self._intended_dims(proposal)
+        if not intended_dims:
+            self._audit(
+                sim_ts,
+                workflow_id,
+                "proposal_replan_skipped",
+                "proposal has no identifiable intended dimensions",
+                {"proposal_id": proposal_id},
+            )
+            return self.store.get_proposal(proposal_id)
+
+        new_base = int(current["version"])
+        merged_config = self._merged_config(
+            current["config"], proposal["body"]["proposed_config"], intended_dims
+        )
+        purpose = self._purpose_for(proposal_id)
+        new_id = self.proposal_id(workflow_id, new_base, merged_config, purpose)
+        body = dict(proposal["body"])
+        body["proposal_id"] = new_id
+        body["base_version"] = new_base
+        body["proposed_config"] = merged_config
+        self._remember_purpose(new_id, purpose)
+        self.store.set_meta(f"replanned_proposal:{proposal_id}", new_id)
+        self._audit(
+            sim_ts,
+            workflow_id,
+            "proposal_replanned",
+            reason,
+            {
+                "old_proposal_id": proposal_id,
+                "new_proposal_id": new_id,
+                "base_version": new_base,
+                "intended_dims": sorted(intended_dims),
+                "changed_dims_preserved": True,
+            },
+        )
+        self.store.save_proposal(
+            new_id,
+            workflow_id,
+            "intent",
+            None,
+            new_base,
+            body,
+            sim_ts,
+        )
+        return self._send_intent(
+            new_id,
+            workflow_id,
+            body,
+            sim_ts,
+            sim_ts,
+            depth=1,
+        )
+
     def _handle_stale(
         self, proposal: dict[str, Any], sim_ts: str, depth: int = 0
     ) -> dict[str, Any]:
@@ -442,39 +536,140 @@ class GovernanceClient:
             return self.store.get_proposal(proposal_id)
 
         current = self.client.get_config(workflow_id)
-        new_base = int(current["version"])
-        purpose = self._purpose_for(proposal_id)
-        body = dict(proposal["body"])
-        new_id = self.proposal_id(
-            workflow_id, new_base, body["proposed_config"], purpose
-        )
-        body["proposal_id"] = new_id
-        body["base_version"] = new_base
-        self._remember_purpose(new_id, purpose)
-        self._audit(
+        return self._replan_from_current(
+            proposal,
             sim_ts,
-            workflow_id,
-            "proposal_replanned",
-            "rebuilt proposal on current config version",
-            {"old_proposal_id": proposal_id, "new_proposal_id": new_id, "base_version": new_base},
+            current,
+            "rebuilt proposal on current config while preserving its intended dimensions",
         )
-        self.store.save_proposal(
-            new_id,
-            workflow_id,
-            "intent",
-            None,
-            new_base,
-            body,
-            sim_ts,
-        )
-        return self._send_intent(
-            new_id,
-            workflow_id,
-            body,
-            sim_ts,
-            sim_ts,
-            depth=depth + 1,
-        )
+
+    def process_supervisor_edits(self, sim_ts: str | None = None) -> list[dict[str, Any]]:
+        sim_ts = self._sim_ts(sim_ts)
+        results: list[dict[str, Any]] = []
+        for event in self.store.list_events("config_changed"):
+            seen_key = f"supervisor_event_seen:{event['event_id']}"
+            if self.store.get_meta(seen_key):
+                continue
+            payload = event.get("payload") or {}
+            if payload.get("actor") != "supervisor":
+                self.store.set_meta(seen_key, "1")
+                continue
+            workflow_id = payload.get("workflow_id") or event.get("workflow_id")
+            if not workflow_id:
+                self.store.set_meta(seen_key, "1")
+                continue
+            workflow_id = str(workflow_id)
+            version = int(payload.get("version") or 0)
+            changed_dims = [str(dim) for dim in payload.get("changed_dims") or []]
+            current = self.client.get_config(workflow_id)
+            current_version = int(current["version"])
+            old_version = version - 1 if version > 0 else None
+            self.store.set_meta(
+                f"supervisor_config:{workflow_id}",
+                {
+                    "version": current_version,
+                    "config": current["config"],
+                    "ts": sim_ts,
+                    "changed_dims": changed_dims,
+                },
+            )
+            self._audit(
+                sim_ts,
+                workflow_id,
+                "supervisor_config_changed",
+                f"supervisor changed {', '.join(changed_dims) or 'config'} "
+                f"from v{old_version} to v{version}",
+                {
+                    "old_version": old_version,
+                    "new_version": version,
+                    "current_version": current_version,
+                    "changed_dims": changed_dims,
+                    "actor": "supervisor",
+                    "proposal_id": payload.get("proposal_id"),
+                    "approval_id": payload.get("approval_id"),
+                    "event_id": event["event_id"],
+                },
+            )
+
+            if "caller_id" in changed_dims and self.detector_reset is not None:
+                self.detector_reset(
+                    workflow_id,
+                    sim_ts,
+                    version,
+                    "supervisor edited caller_id allocations",
+                )
+
+            stale_proposals: list[dict[str, Any]] = []
+            for proposal in self.store.list_proposals(
+                workflow_id=workflow_id,
+                statuses=("intent", "queued", "pending", "approved"),
+            ):
+                if int(proposal["base_version"]) >= version:
+                    continue
+                self.store.save_proposal(
+                    proposal["proposal_id"],
+                    workflow_id,
+                    "stale",
+                    proposal.get("approval_id"),
+                    proposal["base_version"],
+                    proposal["body"],
+                    proposal["created_ts"],
+                    proposal.get("expires_ts"),
+                    proposal.get("apply_by_ts"),
+                    sim_ts,
+                    proposal.get("sent_ts"),
+                )
+                self._audit(
+                    sim_ts,
+                    workflow_id,
+                    "proposal_stale_supervisor_edit",
+                    f"supervisor config v{version} superseded proposal base "
+                    f"v{proposal['base_version']}",
+                    {
+                        "proposal_id": proposal["proposal_id"],
+                        "old_base_version": proposal["base_version"],
+                        "new_version": version,
+                        "changed_dims": changed_dims,
+                    },
+                )
+                stale_proposals.append(proposal)
+
+            replanned: list[str] = []
+            for proposal in stale_proposals:
+                intended_dims = self._intended_dims(proposal)
+                if intended_dims & set(changed_dims):
+                    self._audit(
+                        sim_ts,
+                        workflow_id,
+                        "proposal_replan_skipped",
+                        "supervisor edit touched the same dimension; evidence no longer holds",
+                        {
+                            "proposal_id": proposal["proposal_id"],
+                            "intended_dims": sorted(intended_dims),
+                            "changed_dims": changed_dims,
+                        },
+                    )
+                    continue
+                replanned_proposal = self._replan_from_current(
+                    proposal,
+                    sim_ts,
+                    current,
+                    "supervisor edit was on unrelated dimensions; merged intent onto new base",
+                )
+                replanned.append(replanned_proposal["proposal_id"])
+
+            results.append(
+                {
+                    "workflow_id": workflow_id,
+                    "old_version": old_version,
+                    "new_version": version,
+                    "changed_dims": changed_dims,
+                    "stale": [item["proposal_id"] for item in stale_proposals],
+                    "replanned": replanned,
+                }
+            )
+            self.store.set_meta(seen_key, "1")
+        return results
 
     def _send_intent(
         self,

@@ -511,3 +511,117 @@ def test_ttl_feasible_before_reopen_is_sent_early(tmp_path):
     assert result["status"] == "pending"
     assert len(client.request_calls) == 1
     store.close()
+
+
+def _insert_supervisor_event(
+    store: Store,
+    *,
+    version: int,
+    changed_dims: list[str],
+    event_id: int = 9000,
+    workflow_id: str = "nw_renewal",
+) -> None:
+    store.save_chunk(
+        "events",
+        0,
+        [
+            {
+                "event_id": event_id,
+                "type": "config_changed",
+                "ts": _iso(T0),
+                "workflow_id": workflow_id,
+                "version": version,
+                "actor": "supervisor",
+                "changed_dims": changed_dims,
+                "proposal_id": None,
+                "approval_id": None,
+            }
+        ],
+    )
+
+
+def _propose_voice(gov: GovernanceClient, config: dict):
+    return gov.propose(
+        "nw_renewal",
+        config,
+        "voice_test",
+        sim_ts=_iso(T0),
+        change_summary="test voice allocation",
+        diff={"allocations.default.voice": config["allocations"]["default"]["voice"]},
+        affected_leads=100,
+        dry_run={"replay_hours": 6},
+        impact_score=0.3,
+        rationale="voice evidence",
+        evidence={"voice": "test"},
+    )
+
+
+def test_supervisor_unrelated_edit_replans_pending_proposal(tmp_path):
+    workflow = _workflow()
+    client = FakeClient(workflow, _config())
+    store = Store(tmp_path / "store.db")
+    gov = _gov(store, client)
+    proposed = _config(voice={"V1": 0.5, "V2": 0.5})
+
+    pending = _propose_voice(gov, proposed)
+    supervisor_schedule = {
+        "hour_weights": {"10": 2.0},
+        "lead_preferred_hour": {},
+    }
+    client.config_record["version"] = 2
+    client.config_record["config"]["schedule"] = copy.deepcopy(supervisor_schedule)
+    _insert_supervisor_event(store, version=2, changed_dims=["schedule"])
+
+    results = gov.process_supervisor_edits(sim_ts=_iso(T0 + timedelta(minutes=15)))
+
+    old = store.get_proposal(pending["proposal_id"])
+    assert old["status"] == "stale"
+    assert len(results) == 1
+    assert results[0]["stale"] == [pending["proposal_id"]]
+    new_id = results[0]["replanned"][0]
+    new = store.get_proposal(new_id)
+    assert new["status"] == "pending"
+    assert new["base_version"] == 2
+    assert new["body"]["proposed_config"]["schedule"] == supervisor_schedule
+    assert new["body"]["proposed_config"]["allocations"]["default"]["voice"] == {
+        "V1": 0.5,
+        "V2": 0.5,
+    }
+    kinds = [
+        row[0]
+        for row in store.conn.execute("SELECT kind FROM audit ORDER BY id").fetchall()
+    ]
+    assert "supervisor_config_changed" in kinds
+    assert "proposal_stale_supervisor_edit" in kinds
+    assert "proposal_replanned" in kinds
+    store.close()
+
+
+def test_supervisor_same_dimension_skips_replan_and_resets_detector(tmp_path):
+    workflow = _workflow()
+    client = FakeClient(workflow, _config())
+    store = Store(tmp_path / "store.db")
+    gov = _gov(store, client)
+    resets: list[tuple[str, str, int, str]] = []
+    gov.detector_reset = lambda *args: resets.append(args)
+
+    pending = _propose(gov, _config(caller={"D1": 0.7, "D2": 0.3}))
+    client.config_record["version"] = 2
+    client.config_record["config"]["allocations"]["default"]["caller_id"] = {
+        "D1": 0.2,
+        "D2": 0.8,
+    }
+    _insert_supervisor_event(store, version=2, changed_dims=["caller_id"])
+
+    results = gov.process_supervisor_edits(sim_ts=_iso(T0 + timedelta(minutes=15)))
+
+    assert store.get_proposal(pending["proposal_id"])["status"] == "stale"
+    assert results[0]["replanned"] == []
+    assert len(resets) == 1
+    assert resets[0][0] == "nw_renewal"
+    kinds = [
+        row[0]
+        for row in store.conn.execute("SELECT kind FROM audit ORDER BY id").fetchall()
+    ]
+    assert "proposal_replan_skipped" in kinds
+    store.close()

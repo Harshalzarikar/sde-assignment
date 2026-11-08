@@ -328,6 +328,36 @@ class Store:
         ).fetchone()
         return row[0] if row is not None else None
 
+    def delete_meta_prefix(self, prefix: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM meta WHERE key LIKE ?", (f"{prefix}%",)
+            )
+
+    def list_events(
+        self, event_type: str, after_event_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT event_id, type, ts, workflow_id, payload FROM events "
+            "WHERE type = ?"
+        )
+        params: list[Any] = [event_type]
+        if after_event_id is not None:
+            sql += " AND event_id > ?"
+            params.append(int(after_event_id))
+        sql += " ORDER BY event_id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [
+            {
+                "event_id": int(row[0]),
+                "type": row[1],
+                "ts": row[2],
+                "workflow_id": row[3],
+                "payload": json.loads(row[4]) if row[4] else {},
+            }
+            for row in rows
+        ]
+
     def record_world_fingerprint(self, state: dict[str, Any]) -> None:
         fingerprint = {
             key: state.get(key)

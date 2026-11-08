@@ -145,12 +145,23 @@ class CallerIdHealthDetector:
         now = _parse_ts(sim_ts)
         if now is None:
             return []
+        if self._reset_cooldown_active(workflow_id, now):
+            return []
         workflow = self.client.get_workflow(workflow_id)
         config_record = self.client.get_config(workflow_id)
         config = config_record["config"]
         windows = self._windows(now)
+        floor = self._baseline_floor(workflow_id)
+        if floor is not None:
+            windows = [window for window in windows if window[0] >= floor]
+            if len(windows) < self.config.windows_required:
+                return []
         baseline_start = windows[0][0] - timedelta(hours=self.config.baseline_hours)
         baseline_end = windows[0][0]
+        if floor is not None:
+            baseline_start = max(baseline_start, floor)
+        if baseline_end <= baseline_start:
+            return []
         baseline = self._totals(workflow_id, baseline_start, baseline_end)
         window_totals = [
             self._totals(workflow_id, start, end) for start, end in windows
@@ -904,6 +915,19 @@ class CallerIdHealthDetector:
                 self._save_state(workflow_id, caller_id, state)
                 return state
             if proposal["status"] in TERMINAL_BAD_PROPOSAL_STATUSES:
+                replanned_id = self.store.get_meta(
+                    f"replanned_proposal:{proposal['proposal_id']}"
+                )
+                replanned = (
+                    self.store.get_proposal(replanned_id) if replanned_id else None
+                )
+                if replanned is not None and replanned["status"] not in (
+                    TERMINAL_BAD_PROPOSAL_STATUSES | {"applied"}
+                ):
+                    state["proposal_id"] = replanned["proposal_id"]
+                    state["status"] = "pending"
+                    self._save_state(workflow_id, caller_id, state)
+                    return state
                 state["status"] = "cooling"
                 self._save_state(workflow_id, caller_id, state)
                 return state
@@ -914,6 +938,55 @@ class CallerIdHealthDetector:
                 return None
             return state
         return state
+
+    def reset_workflow(
+        self, workflow_id: str, sim_ts: str, config_version: int, reason: str
+    ) -> None:
+        self.store.delete_meta_prefix(f"{CALLER_STATE_PREFIX}:{workflow_id}:")
+        self.store.set_meta(
+            f"caller_health_baseline:{workflow_id}",
+            {
+                "config_version": int(config_version),
+                "ts": sim_ts,
+                "reason": reason,
+            },
+        )
+        self.store.set_meta(
+            f"caller_health_reset_cooldown:{workflow_id}",
+            {"ts": sim_ts, "config_version": int(config_version)},
+        )
+        self._audit(
+            sim_ts,
+            workflow_id,
+            "caller_id_state_reset",
+            reason,
+            {"config_version": int(config_version)},
+        )
+
+    def _reset_cooldown_active(
+        self, workflow_id: str, now: datetime
+    ) -> bool:
+        raw = self.store.get_meta(f"caller_health_reset_cooldown:{workflow_id}")
+        if not raw:
+            return False
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        started = _parse_ts(value.get("ts")) if isinstance(value, dict) else None
+        if started is None:
+            return False
+        return now < started + timedelta(hours=self.config.cooldown_hours)
+
+    def _baseline_floor(self, workflow_id: str) -> datetime | None:
+        raw = self.store.get_meta(f"caller_health_baseline:{workflow_id}")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return _parse_ts(value.get("ts")) if isinstance(value, dict) else None
 
     def _state_key(self, workflow_id: str, caller_id: str) -> str:
         return f"{CALLER_STATE_PREFIX}:{workflow_id}:{caller_id}"

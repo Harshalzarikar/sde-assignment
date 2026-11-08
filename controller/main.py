@@ -91,9 +91,10 @@ def decide(
     workflows: list[dict[str, Any]],
     sim_ts: str,
     governance: GovernanceClient | None = None,
+    detector: CallerIdHealthDetector | None = None,
 ) -> None:
     governance = governance or GovernanceClient(client, store)
-    detector = CallerIdHealthDetector(client, store, governance)
+    detector = detector or CallerIdHealthDetector(client, store, governance)
     detector.tick(
         sim_ts, workflow_ids=[str(item["workflow_id"]) for item in workflows]
     )
@@ -136,6 +137,9 @@ def run(
     _log_ingest("startup", ingested, elapsed, state, store)
 
     governance = GovernanceClient(client, store)
+    detector = CallerIdHealthDetector(client, store, governance)
+    governance.detector_reset = detector.reset_workflow
+    governance.process_supervisor_edits(sim_ts=state.get("ts"))
     governance.reconcile_all(sim_ts=state.get("ts"))
 
     while True:
@@ -158,7 +162,15 @@ def run(
             _report_event_ranges(client, store)
             live_range_seen = True
 
-        decide(client, store, workflows, state.get("ts", ""), governance=governance)
+        governance.process_supervisor_edits(sim_ts=state.get("ts"))
+        decide(
+            client,
+            store,
+            workflows,
+            state.get("ts", ""),
+            governance=governance,
+            detector=detector,
+        )
         governance.process(sim_ts=state.get("ts"))
 
         if int(state.get("sim_minute", 0)) % 60 == 0:

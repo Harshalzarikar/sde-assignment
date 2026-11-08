@@ -334,6 +334,54 @@ def test_disabled_auto_apply_routes_fix_through_approval(tmp_path):
     store.close()
 
 
+def test_supervisor_caller_edit_resets_recovery_state(tmp_path):
+    store = Store(tmp_path / "store.db")
+    _seed_baseline(store)
+    for offset in (1, 2):
+        _add_hour(store, T0 - timedelta(hours=offset), d3_connected=50)
+    detector, client = _detector(store)
+    governance = detector.governance
+    governance.detector_reset = detector.reset_workflow
+
+    actions = detector.tick(T0.isoformat())
+    assert actions[0]["status"] == "applied"
+    assert detector._load_state(WORKFLOW_ID, "D3") is not None
+
+    client.config_record["version"] = 2
+    client.config_record["config"]["allocations"]["default"]["caller_id"] = {
+        "D1": 0.40,
+        "D2": 0.40,
+        "D3": 0.20,
+    }
+    store.save_chunk(
+        "events",
+        0,
+        [
+            {
+                "event_id": 9100,
+                "type": "config_changed",
+                "ts": T0.isoformat(),
+                "workflow_id": WORKFLOW_ID,
+                "version": 2,
+                "actor": "supervisor",
+                "changed_dims": ["caller_id"],
+            }
+        ],
+    )
+
+    governance.process_supervisor_edits(sim_ts=(T0 + timedelta(minutes=15)).isoformat())
+
+    assert detector._load_state(WORKFLOW_ID, "D3") is None
+    baseline = store.get_meta(f"caller_health_baseline:{WORKFLOW_ID}")
+    assert baseline is not None and '"config_version": 2' in baseline
+    assert client.config_record["config"]["allocations"]["default"]["caller_id"] == {
+        "D1": 0.40,
+        "D2": 0.40,
+        "D3": 0.20,
+    }
+    store.close()
+
+
 def test_recovery_raises_weight_after_consecutive_windows(tmp_path):
     store = Store(tmp_path / "store.db")
     _seed_baseline(store)
