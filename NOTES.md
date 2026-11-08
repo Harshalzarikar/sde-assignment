@@ -91,3 +91,43 @@ Applied response after `POST /workflows/nw_renewal/approvals/apr_00001/apply`:
 
 The approval JSON omits `apply_by` once the approval is applied. Config version moved from 1 to 2,
 and `changed_dims` is present on the pending response too.
+
+## (e) Public scenario runs
+
+`scripts/run_scenario.py <scenario> --name <name>` runs a fresh no-op baseline first, then a fresh simulator
+subprocess for the controller, then grades both runs. The controller never reads the scenario or run
+directories; it only receives the simulator URL. The script sets `PYTHONUTF8=1` so grade reports can write
+non-ASCII characters on Windows.
+
+| Scenario | Grade report | Controller changes | ALL conclusion | ALL pickup | ALL engagement | Hallucinated calls (base) |
+|---|---|---|---|---|---|---|
+| `public_01_dev` | `reports/public_01.md` | 0 | +0.0% | +0.0% | +0.0% | 110 (110) |
+| `public_02_incidents` | `reports/public_02.md` | 1, labeled `beneficial` | +4.4% | +4.1% | -0.1% | 475 (416) |
+
+`public_01_dev` had no incidents and the controller made no changes, so its deltas are exactly zero rather
+than negative. `public_02_incidents` produced one approved change:
+
+- `ks_cancel` v2 `caller_id`: move weight from degraded `D2` to healthy `D1` (`D1` 0.875 / `D2` 0.125).
+  Grade label: **beneficial** (`did_health_delta` +0.361). Workflow outcome: conclusion +11.0%, pickup
+  +9.5%, engagement +0.2%.
+
+Incident timing in `public_02_incidents`:
+
+- `did_flagged` on `ks_cancel` at D2 10:00. The grade report exposes the flagged DID share by day, not an
+  MTTR: 0.371 on D2, 0.122 on D3, then about 0.12-0.13 through D9. Our audit log detected it at D2 16:00
+  and the approved fix applied at D2 17:00, i.e. 7 hours after the D2 10:00 onset by our own clock.
+- `supervisor_edit` on `ks_cancel` at D3 11:30 (`prompt_version` v2 -> v3): grade reports
+  `mttr_minutes: null` and `fixed_by: null`. We did not repair prompt hallucination, so the supervisor edit
+  remains unfixed.
+- `supervisor_edit` on `nw_renewal` at D5 15:00 (`voice` v1 -> v2): no MTTR field, and we did not revert it.
+
+The rise in hallucinated calls (416 baseline -> 475) is consistent with the supervisor prompt/voice edits
+and is not something the current caller-health controller repairs. Overall engagement moved -0.1%, so the
+caller-ID fix improved pickup/conclusion but did not improve the ALL engagement KPI.
+
+Governance for `public_02_incidents`: 1 approval request, 1 approved, 1 applied via approval, 0 expired,
+0 lapsed, 0 conflicts, and peak 1 request/24h for `ks_cancel`. `public_01_dev` made 0 requests.
+
+Controller logs had no errors or tracebacks in either run. The only detector line was the expected
+`[detect] nw_kyc: no alternative caller_id to compare` (the workflow has a single caller ID). SQLite audit
+rows: `public_01_dev` 0, `public_02_incidents` 12.
