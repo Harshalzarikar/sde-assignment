@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from .client import SimClient, SimError
+from .crash import crash_point
 from .store import Store
 
 
@@ -715,6 +716,14 @@ class GovernanceClient:
             )
             raise
 
+        crash_point(
+            "after_api_before_record",
+            {
+                "proposal_id": proposal_id,
+                "workflow_id": workflow_id,
+                "approval_id": self._approval_id(response),
+            },
+        )
         approval_id = self._approval_id(response)
         status = self._approval_status(response)
         expires_ts = response.get("expires_at")
@@ -943,6 +952,10 @@ class GovernanceClient:
             "intent recorded before API call",
             {"proposal_id": proposal_id, "base_version": base_version},
         )
+        crash_point(
+            "after_intent_before_api",
+            {"proposal_id": proposal_id, "workflow_id": workflow_id},
+        )
         return self._send_intent(
             proposal_id, workflow_id, body, sim_ts, sim_ts
         )
@@ -1136,6 +1149,10 @@ class GovernanceClient:
                     "affected_leads": affected_leads,
                 },
             )
+            crash_point(
+                "after_intent_before_api",
+                {"proposal_id": proposal_id, "workflow_id": workflow_id},
+            )
 
         try:
             result = self.client.put_config(workflow_id, body)
@@ -1163,6 +1180,10 @@ class GovernanceClient:
             )
             return {"applied": False, "status": status, "reasons": [exc.body]}
 
+        crash_point(
+            "after_api_before_record",
+            {"proposal_id": proposal_id, "workflow_id": workflow_id},
+        )
         self.store.save_proposal(
             proposal_id,
             workflow_id,

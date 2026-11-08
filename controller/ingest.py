@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .client import SimClient
+from .crash import crash_point
 from .store import Store
 
 
@@ -23,4 +24,8 @@ def ingest_new_chunks(client: SimClient, store: Store) -> dict[str, int]:
             events = client.get_chunk(chunk_no)
             store.save_chunk(kind, chunk_no, events)
             ingested[kind] = ingested.get(kind, 0) + len(events)
+            crash_point(
+                "mid_ingest",
+                {"kind": kind, "chunk": chunk_no, "events": len(events)},
+            )
     return ingested
