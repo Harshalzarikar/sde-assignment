@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "controller.db"
 
 
+def _resolve_db_path(path: str | Path | None = None) -> Path:
+    if path is not None:
+        return Path(path)
+    configured = os.environ.get("CONTROLLER_DB")
+    return Path(configured) if configured else DEFAULT_DB_PATH
+
+
 class Store:
     """A single-file SQLite store with idempotent event ingestion and a cursor."""
 
-    def __init__(self, path: str | Path = DEFAULT_DB_PATH):
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None):
+        self.path = _resolve_db_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path))
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -55,6 +63,10 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS counts_workflow_hour
                 ON counts (workflow_id, hour_bucket);
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -150,6 +162,55 @@ class Store:
         ).fetchone()
         return row[0] if row is not None else None
 
+    def max_event_id(self) -> int | None:
+        row = self.conn.execute("SELECT MAX(event_id) FROM events").fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    def max_cursor(self) -> int | None:
+        row = self.conn.execute('SELECT MAX(value) FROM "cursor"').fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    def set_meta(self, key: str, value: Any) -> None:
+        text = value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False, sort_keys=True
+        )
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, text),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def record_world_fingerprint(self, state: dict[str, Any]) -> None:
+        fingerprint = {
+            key: state.get(key)
+            for key in ("scenario", "end_minute", "tick_minutes")
+        }
+        self.set_meta("world", fingerprint)
+        self.set_meta("last_state", state)
+
+    def world_reset_reason(self, state: dict[str, Any]) -> str | None:
+        current_last = state.get("last_event_id")
+        db_last = self.max_event_id()
+        if (
+            current_last is not None
+            and db_last is not None
+            and int(current_last) < db_last
+        ):
+            return f"sim last_event_id {current_last} < db max event_id {db_last}"
+
+        chunks = state.get("chunks")
+        db_cursor = self.max_cursor()
+        if chunks is not None and db_cursor is not None and int(chunks) < db_cursor:
+            return f"sim chunks {chunks} < db cursor {db_cursor}"
+        return None
+
     def get_cursor(self, kind: str) -> int | None:
         row = self.conn.execute(
             'SELECT value FROM "cursor" WHERE key = ?', (kind,)
@@ -187,3 +248,56 @@ class Store:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
+
+
+def _archive_database(path: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archive = path.with_name(f"{path.name}.{stamp}.bak")
+    for suffix in ("", "-wal", "-shm"):
+        source = Path(f"{path}{suffix}")
+        if source.exists():
+            source.replace(Path(f"{archive}{suffix}"))
+    return archive
+
+
+def open_store(
+    state: dict[str, Any],
+    path: str | Path | None = None,
+    log: Callable[[str], None] = print,
+) -> Store:
+    db_path = _resolve_db_path(path)
+    reset_reason: str | None = None
+    archive: Path | None = None
+
+    if db_path.exists():
+        existing = Store(db_path)
+        try:
+            reset_reason = existing.world_reset_reason(state)
+        finally:
+            existing.close()
+
+        if reset_reason is not None:
+            archive = _archive_database(db_path)
+            log(
+                f"[store] simulator reset detected ({reset_reason}); "
+                f"archived {db_path.name} -> {archive.name}"
+            )
+
+    store = Store(db_path)
+    store.record_world_fingerprint(state)
+    if reset_reason is not None:
+        store.write_audit(
+            state.get("ts"),
+            None,
+            "sim_reset",
+            reset_reason,
+            {"archive": str(archive), "state": state},
+        )
+        log(f"[store] starting fresh database at {store.path}")
+    else:
+        log(
+            f"[store] resuming database at {store.path} "
+            f"(history cursor={store.get_cursor('history')}, "
+            f"events cursor={store.get_cursor('events')})"
+        )
+    return store

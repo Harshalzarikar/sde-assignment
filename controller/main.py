@@ -11,7 +11,7 @@ from typing import Any
 
 from .client import ScenarioFinished, SimClient
 from .ingest import ingest_new_chunks
-from .store import Store
+from .store import Store, open_store
 
 
 def _parse_ts(ts: str | None) -> datetime | None:
@@ -176,12 +176,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    store = Store(args.db) if args.db else Store()
     client = SimClient(args.sim_url, timeout=60, retries=3)
+    store: Store | None = None
     try:
+        state = client.get_state()
+        store = open_store(state, args.db)
         run(client, store, tick=args.tick, stop_after_minutes=args.stop_after_minutes)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
     return 0
 
 
