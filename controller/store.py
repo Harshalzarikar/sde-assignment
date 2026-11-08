@@ -5,12 +5,22 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "controller.db"
+
+SENT_PROPOSAL_STATUSES = (
+    "pending",
+    "approved",
+    "applied",
+    "rejected",
+    "expired",
+    "lapsed",
+    "stale",
+)
 
 
 def _resolve_db_path(path: str | Path | None = None) -> Path:
@@ -67,6 +77,20 @@ class Store:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS proposals (
+                proposal_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approval_id TEXT,
+                base_version INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                created_ts TEXT NOT NULL,
+                expires_ts TEXT,
+                apply_by_ts TEXT,
+                updated_ts TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS proposals_workflow_status
+                ON proposals (workflow_id, status);
             """
         )
         self.conn.commit()
@@ -169,6 +193,113 @@ class Store:
     def max_cursor(self) -> int | None:
         row = self.conn.execute('SELECT MAX(value) FROM "cursor"').fetchone()
         return int(row[0]) if row is not None and row[0] is not None else None
+
+    def save_proposal(
+        self,
+        proposal_id: str,
+        workflow_id: str,
+        status: str,
+        approval_id: str | None,
+        base_version: int,
+        body: dict[str, Any],
+        created_ts: str,
+        expires_ts: str | None = None,
+        apply_by_ts: str | None = None,
+        updated_ts: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO proposals "
+                "(proposal_id, workflow_id, status, approval_id, base_version, body, "
+                "created_ts, expires_ts, apply_by_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(proposal_id) DO UPDATE SET "
+                "workflow_id = excluded.workflow_id, "
+                "status = excluded.status, "
+                "approval_id = COALESCE(excluded.approval_id, proposals.approval_id), "
+                "base_version = excluded.base_version, "
+                "body = excluded.body, "
+                "expires_ts = COALESCE(excluded.expires_ts, proposals.expires_ts), "
+                "apply_by_ts = COALESCE(excluded.apply_by_ts, proposals.apply_by_ts), "
+                "updated_ts = excluded.updated_ts",
+                (
+                    proposal_id,
+                    workflow_id,
+                    status,
+                    approval_id,
+                    int(base_version),
+                    json.dumps(body, ensure_ascii=False, sort_keys=True),
+                    created_ts,
+                    expires_ts,
+                    apply_by_ts,
+                    updated_ts or created_ts,
+                ),
+            )
+
+    @staticmethod
+    def _proposal_row(row: Any) -> dict[str, Any]:
+        return {
+            "proposal_id": row[0],
+            "workflow_id": row[1],
+            "status": row[2],
+            "approval_id": row[3],
+            "base_version": int(row[4]),
+            "body": json.loads(row[5]),
+            "created_ts": row[6],
+            "expires_ts": row[7],
+            "apply_by_ts": row[8],
+            "updated_ts": row[9],
+        }
+
+    def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
+            "created_ts, expires_ts, apply_by_ts, updated_ts "
+            "FROM proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        return self._proposal_row(row) if row is not None else None
+
+    def list_proposals(
+        self, workflow_id: str | None = None, statuses: list[str] | tuple[str, ...] | None = None
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(workflow_id)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        sql = (
+            "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
+            "created_ts, expires_ts, apply_by_ts, updated_ts FROM proposals"
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_ts, proposal_id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._proposal_row(row) for row in rows]
+
+    def count_requests_24h(self, workflow_id: str, sim_now: str) -> int:
+        now = datetime.fromisoformat(str(sim_now))
+        cutoff = now - timedelta(hours=24)
+        placeholders = ", ".join("?" for _ in SENT_PROPOSAL_STATUSES)
+        rows = self.conn.execute(
+            "SELECT created_ts FROM proposals "
+            f"WHERE workflow_id = ? AND status IN ({placeholders})",
+            (workflow_id, *SENT_PROPOSAL_STATUSES),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(str(row[0]))
+            except ValueError:
+                continue
+            if created >= cutoff:
+                count += 1
+        return count
 
     def set_meta(self, key: str, value: Any) -> None:
         text = value if isinstance(value, str) else json.dumps(

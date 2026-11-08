@@ -130,5 +130,24 @@ class SimClient:
             params={"workflow_id": workflow_id, "status": status},
         )
 
+    def request_approval(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/approvals", body=body)
+
+    def get_approval(self, approval_id: str) -> dict[str, Any]:
+        aid = urllib.parse.quote(approval_id, safe="")
+        return self._request("GET", f"/approvals/{aid}")
+
+    def apply_approval(self, workflow_id: str, approval_id: str) -> dict[str, Any]:
+        wid = urllib.parse.quote(workflow_id, safe="")
+        return self._request(
+            "POST",
+            f"/workflows/{wid}/apply",
+            body={"approval_id": approval_id},
+        )
+
+    def put_config(self, workflow_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        wid = urllib.parse.quote(workflow_id, safe="")
+        return self._request("PUT", f"/workflows/{wid}/config", body=body)
+
     def advance(self, minutes: int) -> dict[str, Any]:
         return self._request("POST", "/sim/advance", body={"minutes": int(minutes)})
