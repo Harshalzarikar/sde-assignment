@@ -43,3 +43,51 @@ through minute 0); the events chunk list is empty.
 - `ks_cancel` has the broadest auto-apply dimensions (including welcome message and voice) but the tightest
   `max_shift` (0.2), shortest TTL (12h), lowest reject rate (0.05), and highest request cap (4/24h).
 - `nw_renewal` allows auto-apply only for `schedule` and `caller_id`, but with the loosest `max_shift` (0.5).
+
+## (d) Live approval round trip (fresh simulator, HTTP only)
+
+Pending response after `POST /workflows/nw_renewal/approvals` (created_at is the actual send time):
+
+```json
+{
+  "approval_id": "apr_00001",
+  "base_version": 1,
+  "changed_dims": ["caller_id"],
+  "created_at": "2027-01-04T10:00:00+05:30",
+  "expires_at": "2027-01-05T10:00:00+05:30",
+  "proposal_id": "prop_live_probe",
+  "status": "pending",
+  "workflow_id": "nw_renewal"
+}
+```
+
+Approved response after `GET /approvals/apr_00001`:
+
+```json
+{
+  "approval_id": "apr_00001",
+  "apply_by": "2027-01-04T14:27:00+05:30",
+  "base_version": 1,
+  "changed_dims": ["caller_id"],
+  "created_at": "2027-01-04T10:00:00+05:30",
+  "decided_at": "2027-01-04T12:27:00+05:30",
+  "expires_at": "2027-01-05T10:00:00+05:30",
+  "proposal_id": "prop_live_probe",
+  "reasons": [],
+  "status": "approved",
+  "workflow_id": "nw_renewal"
+}
+```
+
+Applied response after `POST /workflows/nw_renewal/approvals/apr_00001/apply`:
+
+```json
+{
+  "changed_dims": ["caller_id"],
+  "version": 2,
+  "workflow_id": "nw_renewal"
+}
+```
+
+The approval JSON omits `apply_by` once the approval is applied. Config version moved from 1 to 2,
+and `changed_dims` is present on the pending response too.

@@ -87,12 +87,18 @@ class Store:
                 created_ts TEXT NOT NULL,
                 expires_ts TEXT,
                 apply_by_ts TEXT,
-                updated_ts TEXT NOT NULL
+                updated_ts TEXT NOT NULL,
+                sent_ts TEXT
             );
             CREATE INDEX IF NOT EXISTS proposals_workflow_status
                 ON proposals (workflow_id, status);
             """
         )
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(proposals)").fetchall()
+        }
+        if "sent_ts" not in columns:
+            self.conn.execute("ALTER TABLE proposals ADD COLUMN sent_ts TEXT")
         self.conn.commit()
 
     def save_chunk(self, kind: str, chunk_no: int, events: Iterable[dict[str, Any]]) -> None:
@@ -206,13 +212,14 @@ class Store:
         expires_ts: str | None = None,
         apply_by_ts: str | None = None,
         updated_ts: str | None = None,
+        sent_ts: str | None = None,
     ) -> None:
         with self.conn:
             self.conn.execute(
                 "INSERT INTO proposals "
                 "(proposal_id, workflow_id, status, approval_id, base_version, body, "
-                "created_ts, expires_ts, apply_by_ts, updated_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(proposal_id) DO UPDATE SET "
                 "workflow_id = excluded.workflow_id, "
                 "status = excluded.status, "
@@ -221,7 +228,8 @@ class Store:
                 "body = excluded.body, "
                 "expires_ts = COALESCE(excluded.expires_ts, proposals.expires_ts), "
                 "apply_by_ts = COALESCE(excluded.apply_by_ts, proposals.apply_by_ts), "
-                "updated_ts = excluded.updated_ts",
+                "updated_ts = excluded.updated_ts, "
+                "sent_ts = COALESCE(excluded.sent_ts, proposals.sent_ts)",
                 (
                     proposal_id,
                     workflow_id,
@@ -233,6 +241,7 @@ class Store:
                     expires_ts,
                     apply_by_ts,
                     updated_ts or created_ts,
+                    sent_ts,
                 ),
             )
 
@@ -249,12 +258,13 @@ class Store:
             "expires_ts": row[7],
             "apply_by_ts": row[8],
             "updated_ts": row[9],
+            "sent_ts": row[10],
         }
 
     def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
-            "created_ts, expires_ts, apply_by_ts, updated_ts "
+            "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts "
             "FROM proposals WHERE proposal_id = ?",
             (proposal_id,),
         ).fetchone()
@@ -274,7 +284,7 @@ class Store:
             params.extend(statuses)
         sql = (
             "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
-            "created_ts, expires_ts, apply_by_ts, updated_ts FROM proposals"
+            "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts FROM proposals"
         )
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -287,7 +297,7 @@ class Store:
         cutoff = now - timedelta(hours=24)
         placeholders = ", ".join("?" for _ in SENT_PROPOSAL_STATUSES)
         rows = self.conn.execute(
-            "SELECT created_ts FROM proposals "
+            "SELECT COALESCE(sent_ts, created_ts) FROM proposals "
             f"WHERE workflow_id = ? AND status IN ({placeholders})",
             (workflow_id, *SENT_PROPOSAL_STATUSES),
         ).fetchall()

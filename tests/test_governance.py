@@ -129,6 +129,7 @@ class FakeClient:
             "workflow_id": body["workflow_id"],
             "proposal_id": body["proposal_id"],
             "status": "pending",
+            "created_at": _iso(T0),
             "expires_at": _iso(T0 + timedelta(hours=24)),
             "apply_by": None,
             "reasons": [],
@@ -413,4 +414,100 @@ def test_try_auto_apply_uses_put_only_when_locally_allowed(tmp_path):
     assert result["applied"] is True
     assert len(client.put_calls) == 1
     assert client.put_calls[0][1]["proposal_id"] == result["proposal_id"]
+    store.close()
+
+
+def test_proposal_sent_ts_uses_approval_created_at(tmp_path):
+    workflow = _workflow()
+    client = FakeClient(workflow, _config())
+    store = Store(tmp_path / "store.db")
+    gov = _gov(store, client)
+
+    result = _propose(gov, _config(caller={"D1": 1.0}))
+
+    proposal = store.get_proposal(result["proposal_id"])
+    assert proposal["sent_ts"] == _iso(T0)
+    assert proposal["created_ts"] == _iso(T0)
+    store.close()
+
+
+def test_24h_cap_counts_from_actual_send_time(tmp_path):
+    client = FakeClient(_workflow(), _config())
+    store = Store(tmp_path / "store.db")
+    store.save_proposal(
+        "recent",
+        "nw_renewal",
+        "pending",
+        None,
+        1,
+        {"proposal_id": "recent"},
+        _iso(T0 - timedelta(hours=1)),
+        sent_ts=_iso(T0 - timedelta(hours=23)),
+    )
+    store.save_proposal(
+        "old",
+        "nw_renewal",
+        "pending",
+        None,
+        1,
+        {"proposal_id": "old"},
+        _iso(T0 - timedelta(hours=2)),
+        sent_ts=_iso(T0 - timedelta(hours=25)),
+    )
+    store.save_proposal(
+        "legacy",
+        "nw_renewal",
+        "pending",
+        None,
+        1,
+        {"proposal_id": "legacy"},
+        _iso(T0 - timedelta(hours=4)),
+    )
+
+    assert store.count_requests_24h("nw_renewal", _iso(T0)) == 2
+    store.close()
+
+
+def test_ttl_infeasible_proposal_is_queued_not_sent(tmp_path):
+    workflow = _workflow()
+    workflow["governance"]["proposal_ttl_hours"] = 12
+    client = FakeClient(workflow, _config())
+    store = Store(tmp_path / "store.db")
+    gov = _gov(store, client)
+
+    queued = _propose(
+        gov,
+        _config(caller={"D1": 1.0}),
+        sim_ts=datetime.fromisoformat("2027-01-04T18:30:00+05:30"),
+    )
+
+    assert queued["status"] == "queued"
+    assert client.request_calls == []
+    audit = store.conn.execute(
+        "SELECT kind, reason FROM audit ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert audit[0] == "proposal_queued"
+    assert "TTL" in audit[1]
+
+    gov.process(sim_ts=_iso(datetime.fromisoformat("2027-01-05T09:45:00+05:30")))
+    assert store.get_proposal(queued["proposal_id"])["status"] == "pending"
+    assert len(client.request_calls) == 1
+    store.close()
+
+
+def test_ttl_feasible_before_reopen_is_sent_early(tmp_path):
+    workflow = _workflow()
+    workflow["governance"]["proposal_ttl_hours"] = 12
+    client = FakeClient(workflow, _config())
+    store = Store(tmp_path / "store.db")
+    gov = _gov(store, client)
+
+    result = _propose(
+        gov,
+        _config(caller={"D1": 1.0}),
+        sim_ts=datetime.fromisoformat("2027-01-05T09:45:00+05:30"),
+    )
+
+    assert result["status"] == "pending"
+    assert len(client.request_calls) == 1
     store.close()

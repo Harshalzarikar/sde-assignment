@@ -121,19 +121,83 @@ class GovernanceClient:
     ) -> None:
         self.store.write_audit(sim_ts, workflow_id, kind, reason, evidence)
 
-    def _should_send_now(self, sim_dt: datetime | None, approver_hours: Any) -> bool:
-        if sim_dt is None:
-            return True
+    @staticmethod
+    def _window_bounds(day_dt: datetime, approver_hours: Any) -> tuple[datetime, datetime] | None:
         if not isinstance(approver_hours, (list, tuple)) or len(approver_hours) != 2:
-            return True
+            return None
         start, end = int(approver_hours[0]), int(approver_hours[1])
-        hour = sim_dt.hour + sim_dt.minute / 60.0
-        if start <= hour < end:
-            return True
-        next_start = sim_dt.replace(hour=start, minute=0, second=0, microsecond=0)
-        if sim_dt >= next_start:
-            next_start += timedelta(days=1)
-        return (next_start - sim_dt) <= timedelta(minutes=self.queue_lead_minutes)
+        if not (0 <= start < 24) or not (0 < end <= 24) or start >= end:
+            return None
+        start_dt = day_dt.replace(hour=start, minute=0, second=0, microsecond=0)
+        if end >= 24:
+            end_dt = (day_dt + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        else:
+            end_dt = day_dt.replace(hour=end, minute=0, second=0, microsecond=0)
+        return start_dt, end_dt
+
+    def _approver_decision_ts(
+        self, start_dt: datetime, approver_hours: Any, latency_minutes: float
+    ) -> datetime:
+        remaining = timedelta(minutes=max(0.0, float(latency_minutes)))
+        bounds = self._window_bounds(start_dt, approver_hours)
+        if bounds is None:
+            return start_dt + remaining
+        cursor = start_dt
+        for _ in range(14):
+            day = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_dt_day, end_dt_day = self._window_bounds(day, approver_hours)
+            if cursor < start_dt_day:
+                cursor = start_dt_day
+            if cursor >= end_dt_day:
+                cursor = (day + timedelta(days=1)).replace(
+                    hour=start_dt_day.hour, minute=0, second=0, microsecond=0
+                )
+                continue
+            available = end_dt_day - cursor
+            if available >= remaining:
+                return cursor + remaining
+            remaining -= available
+            cursor = (day + timedelta(days=1)).replace(
+                hour=start_dt_day.hour, minute=0, second=0, microsecond=0
+            )
+        return cursor + remaining
+
+    def _send_decision(
+        self, sim_dt: datetime | None, governance: dict[str, Any]
+    ) -> tuple[bool, str]:
+        if sim_dt is None:
+            return True, ""
+        approver_hours = governance.get("approver_hours")
+        latency = governance.get("approver_latency_minutes")
+        if isinstance(latency, (list, tuple)) and latency:
+            max_latency = max(float(value) for value in latency)
+        else:
+            max_latency = 0.0
+        ttl_hours = governance.get("proposal_ttl_hours")
+
+        bounds = self._window_bounds(sim_dt, approver_hours)
+        if bounds is not None:
+            start_dt, end_dt = bounds
+            if not (start_dt <= sim_dt < end_dt):
+                next_start = start_dt if sim_dt < start_dt else start_dt + timedelta(days=1)
+                if (next_start - sim_dt) > timedelta(minutes=self.queue_lead_minutes):
+                    return False, "approver hours closed"
+
+        if ttl_hours is None:
+            return True, ""
+        decision_ts = self._approver_decision_ts(
+            sim_dt, approver_hours, max_latency
+        )
+        deadline = sim_dt + timedelta(hours=float(ttl_hours))
+        if decision_ts > deadline:
+            return (
+                False,
+                "latest plausible decision "
+                f"{decision_ts.isoformat()} would miss proposal TTL {deadline.isoformat()}",
+            )
+        return True, ""
 
     def _make_body(
         self,
@@ -207,7 +271,7 @@ class GovernanceClient:
         return str(approval.get("status") or "pending")
 
     def _approval_id(self, approval: dict[str, Any]) -> str | None:
-        value = approval.get("approval_id") or approval.get("id")
+        value = approval.get("approval_id")
         return str(value) if value is not None else None
 
     def _record_approval(
@@ -220,17 +284,10 @@ class GovernanceClient:
         workflow_id = proposal["workflow_id"]
         status = self._approval_status(approval)
         approval_id = self._approval_id(approval) or proposal.get("approval_id")
-        expires_ts = (
-            approval.get("expires_at")
-            or approval.get("expires_ts")
-            or proposal.get("expires_ts")
-        )
-        apply_by_ts = (
-            approval.get("apply_by")
-            or approval.get("apply_by_ts")
-            or proposal.get("apply_by_ts")
-        )
-        reasons = approval.get("reasons") or approval.get("reason") or []
+        expires_ts = approval.get("expires_at") or proposal.get("expires_ts")
+        apply_by_ts = approval.get("apply_by") or proposal.get("apply_by_ts")
+        reasons = approval.get("reasons") or []
+        sent_ts = proposal.get("sent_ts") or approval.get("created_at") or sim_ts
 
         now = _parse_ts(sim_ts)
         expiry = _parse_ts(expires_ts)
@@ -249,6 +306,7 @@ class GovernanceClient:
             expires_ts,
             apply_by_ts,
             sim_ts,
+            sent_ts,
         )
         self._audit(
             sim_ts,
@@ -464,8 +522,9 @@ class GovernanceClient:
 
         approval_id = self._approval_id(response)
         status = self._approval_status(response)
-        expires_ts = response.get("expires_at") or response.get("expires_ts")
-        apply_by_ts = response.get("apply_by") or response.get("apply_by_ts")
+        expires_ts = response.get("expires_at")
+        apply_by_ts = response.get("apply_by")
+        sent_ts = response.get("created_at") or sim_ts
         self.store.save_proposal(
             proposal_id,
             workflow_id,
@@ -477,6 +536,7 @@ class GovernanceClient:
             expires_ts,
             apply_by_ts,
             sim_ts,
+            sent_ts,
         )
         self._audit(
             sim_ts,
@@ -499,9 +559,8 @@ class GovernanceClient:
         status = proposal["status"]
         if status not in ("intent", "queued"):
             return proposal
-        if not self._should_send_now(
-            _parse_ts(sim_ts), governance.get("approver_hours")
-        ):
+        send_now, reason = self._send_decision(_parse_ts(sim_ts), governance)
+        if not send_now:
             if status != "queued":
                 self.store.save_proposal(
                     proposal["proposal_id"],
@@ -514,13 +573,21 @@ class GovernanceClient:
                     proposal.get("expires_ts"),
                     proposal.get("apply_by_ts"),
                     sim_ts,
+                    proposal.get("sent_ts"),
                 )
                 self._audit(
                     sim_ts,
                     proposal["workflow_id"],
                     "proposal_queued",
-                    "approver hours closed",
-                    {"proposal_id": proposal["proposal_id"]},
+                    reason,
+                    {
+                        "proposal_id": proposal["proposal_id"],
+                        "approver_hours": governance.get("approver_hours"),
+                        "approver_latency_minutes": governance.get(
+                            "approver_latency_minutes"
+                        ),
+                        "proposal_ttl_hours": governance.get("proposal_ttl_hours"),
+                    },
                 )
                 return self.store.get_proposal(proposal["proposal_id"])
             return proposal
@@ -551,6 +618,7 @@ class GovernanceClient:
             proposal.get("expires_ts"),
             proposal.get("apply_by_ts"),
             sim_ts,
+            proposal.get("sent_ts"),
         )
         return self._send_intent(
             proposal["proposal_id"],
@@ -635,7 +703,8 @@ class GovernanceClient:
             evidence,
         )
 
-        if not self._should_send_now(_parse_ts(sim_ts), governance.get("approver_hours")):
+        send_now, reason = self._send_decision(_parse_ts(sim_ts), governance)
+        if not send_now:
             self.store.save_proposal(
                 proposal_id,
                 workflow_id,
@@ -645,13 +714,20 @@ class GovernanceClient:
                 body,
                 sim_ts,
                 _add_hours(sim_ts, governance.get("proposal_ttl_hours")),
+                None,
+                sim_ts,
             )
             self._audit(
                 sim_ts,
                 workflow_id,
                 "proposal_queued",
-                "approver hours closed; queued until the window reopens",
-                {"proposal_id": proposal_id, "approver_hours": governance.get("approver_hours")},
+                reason,
+                {
+                    "proposal_id": proposal_id,
+                    "approver_hours": governance.get("approver_hours"),
+                    "approver_latency_minutes": governance.get("approver_latency_minutes"),
+                    "proposal_ttl_hours": governance.get("proposal_ttl_hours"),
+                },
             )
             return self.store.get_proposal(proposal_id)
 
