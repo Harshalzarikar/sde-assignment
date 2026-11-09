@@ -1,1204 +1,290 @@
-"""Proposal lifecycle, approval reconciliation, and auto-apply policy checks."""
+"""The permission sender. Every change goes through here: an approval request, or an auto-apply the policy allows.
 
-from __future__ import annotations
-
-import copy
+Crash safety: a proposal is written to the notebook (status 'sending') before the HTTP call, with an id derived
+from what it changes. After a restart, `reconcile` finishes whatever was half-done, and the simulator's
+duplicate-id check stops anything from being sent or applied twice.
+"""
 import hashlib
 import json
-from datetime import datetime, timedelta
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Callable
 
-from .client import SimClient, SimError
-from .crash import crash_point
-from .store import Store
+# From stakeholders/04 (Kestrel ops supervisor): at most 2 requests a day, never before 11:00.
+# Stricter than the policy, so honouring it is our choice. Safety incidents may still use the policy's full limit.
+PREFERENCES = {"kestrel_finance": {"earliest_hour": 11, "max_requests_per_24h": 2}}
 
-
-NON_TERMINAL_STATUSES = ("intent", "queued", "pending", "approved")
-DISTRIBUTION_DIMS = ("welcome_message", "voice", "caller_id")
-CHANGE_DIMS = (
-    "cohorts",
-    "welcome_message",
-    "voice",
-    "caller_id",
-    "prompt_version",
-    "schedule",
-)
+OPEN = ("sending", "pending", "approved", "applying")
 
 
-class GovernanceError(Exception):
-    """Base class for governance failures."""
+@dataclass
+class Change:
+    """One manager's wish. `edit` applies it to a config in place, so wishes can be stacked into one request."""
+    name: str
+    path: str  # "auto" | "approval"
+    edit: Callable[[dict], None]
+    summary: str
+    rationale: str
+    diff: dict = field(default_factory=dict)
+    evidence: dict = field(default_factory=dict)
+    dry_run: dict = field(default_factory=dict)
+    impact: float = 0.3
+    affected_leads: int = 0
+    urgent: bool = False
 
 
-class RateLimitError(GovernanceError):
-    """The per-workflow 24h request cap would be exceeded."""
+def next_working(t: int, hours: list) -> int:
+    lo, hi = hours
+    day, mod = divmod(t, 1440)
+    if mod < lo * 60:
+        return day * 1440 + lo * 60
+    if mod >= hi * 60:
+        return (day + 1) * 1440 + lo * 60
+    return t
 
 
-class ProposalPolicyError(GovernanceError):
-    """A proposal does not satisfy the workflow policy."""
-
-
-def _parse_ts(ts: str | None) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(str(ts))
-    except ValueError:
-        return None
-
-
-def _canonical(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _reason_text(body: Any) -> str:
-    if isinstance(body, dict):
-        return str(body.get("detail") or body.get("error") or body)
-    return str(body)
-
-
-def _has_reason(body: Any, reason: str) -> bool:
-    return reason in _reason_text(body)
-
-
-def _add_hours(ts: str | None, hours: Any) -> str | None:
-    base = _parse_ts(ts)
-    if base is None or hours is None:
-        return None
-    return (base + timedelta(hours=float(hours))).isoformat()
-
-
-class GovernanceClient:
-    """Coordinates proposals through the simulator's governance boundary."""
-
-    def __init__(
-        self,
-        client: SimClient,
-        store: Store,
-        log: Callable[[str], None] = print,
-        queue_lead_minutes: int = 30,
-        detector_reset: Callable[[str, str, int, str], None] | None = None,
-    ):
-        self.client = client
+class Governance:
+    def __init__(self, api, store, workflows: dict):
+        self.api = api
         self.store = store
-        self.log = log
-        self.queue_lead_minutes = int(queue_lead_minutes)
-        self.detector_reset = detector_reset
+        self.wf = workflows
+        self._config_cache: dict = {}
+        self.checks = []  # callables(proposal row) -> reason to withdraw it, or None
 
-    def proposal_id(
-        self,
-        workflow_id: str,
-        base_version: int,
-        proposed_config: dict[str, Any],
-        purpose: str,
-    ) -> str:
-        material = "|".join(
-            [
-                str(workflow_id),
-                str(int(base_version)),
-                str(purpose),
-                _canonical(proposed_config),
-            ]
-        )
-        return "prop_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    def current(self, wid: str):
+        """(version, config). Cached within a tick: the world only changes when time advances or we apply."""
+        if wid not in self._config_cache:
+            body = self.api.get_ok(f"/workflows/{wid}/config")
+            self._config_cache[wid] = (body["version"], body["config"])
+            known = self.store.meta(f"config:{wid}")
+            if not known or known["version"] != body["version"]:
+                self.store.set_meta(f"config:{wid}", {"version": body["version"], "config": body["config"]})
+        version, config = self._config_cache[wid]
+        return version, json.loads(json.dumps(config))
 
-    def _sim_ts(self, sim_ts: str | None) -> str:
-        if sim_ts:
-            return sim_ts
-        return str(self.client.get_state().get("ts"))
+    def in_flight(self, wid: str) -> bool:
+        return bool(self.store.proposals(wid, OPEN))
 
-    def _purpose_key(self, proposal_id: str) -> str:
-        return f"proposal_purpose:{proposal_id}"
-
-    def _remember_purpose(self, proposal_id: str, purpose: str) -> None:
-        self.store.set_meta(self._purpose_key(proposal_id), purpose)
-
-    def _purpose_for(self, proposal_id: str) -> str:
-        return self.store.get_meta(self._purpose_key(proposal_id)) or "repropose"
-
-    def _audit(
-        self,
-        sim_ts: str | None,
-        workflow_id: str | None,
-        kind: str,
-        reason: str,
-        evidence: Any,
-    ) -> None:
-        self.store.write_audit(sim_ts, workflow_id, kind, reason, evidence)
-
-    @staticmethod
-    def _window_bounds(day_dt: datetime, approver_hours: Any) -> tuple[datetime, datetime] | None:
-        if not isinstance(approver_hours, (list, tuple)) or len(approver_hours) != 2:
-            return None
-        start, end = int(approver_hours[0]), int(approver_hours[1])
-        if not (0 <= start < 24) or not (0 < end <= 24) or start >= end:
-            return None
-        start_dt = day_dt.replace(hour=start, minute=0, second=0, microsecond=0)
-        if end >= 24:
-            end_dt = (day_dt + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-        else:
-            end_dt = day_dt.replace(hour=end, minute=0, second=0, microsecond=0)
-        return start_dt, end_dt
-
-    def _approver_decision_ts(
-        self, start_dt: datetime, approver_hours: Any, latency_minutes: float
-    ) -> datetime:
-        remaining = timedelta(minutes=max(0.0, float(latency_minutes)))
-        bounds = self._window_bounds(start_dt, approver_hours)
-        if bounds is None:
-            return start_dt + remaining
-        cursor = start_dt
-        for _ in range(14):
-            day = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
-            start_dt_day, end_dt_day = self._window_bounds(day, approver_hours)
-            if cursor < start_dt_day:
-                cursor = start_dt_day
-            if cursor >= end_dt_day:
-                cursor = (day + timedelta(days=1)).replace(
-                    hour=start_dt_day.hour, minute=0, second=0, microsecond=0
-                )
-                continue
-            available = end_dt_day - cursor
-            if available >= remaining:
-                return cursor + remaining
-            remaining -= available
-            cursor = (day + timedelta(days=1)).replace(
-                hour=start_dt_day.hour, minute=0, second=0, microsecond=0
-            )
-        return cursor + remaining
-
-    def _send_decision(
-        self, sim_dt: datetime | None, governance: dict[str, Any]
-    ) -> tuple[bool, str]:
-        if sim_dt is None:
-            return True, ""
-        approver_hours = governance.get("approver_hours")
-        latency = governance.get("approver_latency_minutes")
-        if isinstance(latency, (list, tuple)) and latency:
-            max_latency = max(float(value) for value in latency)
-        else:
-            max_latency = 0.0
-        ttl_hours = governance.get("proposal_ttl_hours")
-
-        bounds = self._window_bounds(sim_dt, approver_hours)
-        if bounds is not None:
-            start_dt, end_dt = bounds
-            if not (start_dt <= sim_dt < end_dt):
-                next_start = start_dt if sim_dt < start_dt else start_dt + timedelta(days=1)
-                if (next_start - sim_dt) > timedelta(minutes=self.queue_lead_minutes):
-                    return False, "approver hours closed"
-
-        if ttl_hours is None:
-            return True, ""
-        decision_ts = self._approver_decision_ts(
-            sim_dt, approver_hours, max_latency
-        )
-        deadline = sim_dt + timedelta(hours=float(ttl_hours))
-        if decision_ts > deadline:
-            return (
-                False,
-                "latest plausible decision "
-                f"{decision_ts.isoformat()} would miss proposal TTL {deadline.isoformat()}",
-            )
+    def can_request(self, wid: str, now: int, urgent: bool = False):
+        """(ok, reason). Routine requests keep one slot of the daily limit free for incidents."""
+        w = self.wf[wid]
+        gov = w["governance"]
+        pref = PREFERENCES.get(w["tenant_id"], {})
+        lo, hi = gov["approver_hours"]
+        earliest = lo if urgent else max(lo, pref.get("earliest_hour", lo))
+        if not earliest * 60 <= now % 1440 < hi * 60:
+            return False, "outside approver hours"
+        worst = next_working(now + gov["approver_latency_minutes"][1], [lo, hi])
+        if worst > now + gov["proposal_ttl_hours"] * 60:
+            return False, "the approver might not answer before the request expires"
+        used = self.store.requests_since(wid, now - 1440)
+        limit = gov["max_requests_per_24h"]
+        cap = limit if urgent else min(limit, pref.get("max_requests_per_24h", limit)) - 1
+        if used >= cap:
+            return False, f"daily request budget used ({used}/{cap})"
         return True, ""
 
-    def _make_body(
-        self,
-        workflow: dict[str, Any],
-        proposal_id: str,
-        base_version: int,
-        proposed_config: dict[str, Any],
-        old_config: dict[str, Any],
-        change_summary: str,
-        diff: Any,
-        affected_leads: int,
-        dry_run: Any,
-        impact_score: float,
-        rationale: str,
-        evidence: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        governance = workflow.get("governance") or {}
-        if not change_summary:
-            raise ProposalPolicyError("change_summary is required")
-        if not diff:
-            raise ProposalPolicyError("diff is required")
-        if not dry_run:
-            raise ProposalPolicyError("dry_run is required")
-        if not rationale:
-            raise ProposalPolicyError("rationale is required")
-        if not isinstance(affected_leads, int) or affected_leads < 0:
-            raise ProposalPolicyError("affected_leads must be a non-negative integer")
-        if not (0.0 <= float(impact_score) <= 1.0):
-            raise ProposalPolicyError("impact_score must be in [0, 1]")
+    def _new_id(self, wid: str, base: int, path: str, config: dict):
+        """A fresh id for this exact (workflow, base version, path, config), or None if the simulator already refused
+        that config as invalid: sending it again cannot succeed and would only spam the approval log."""
+        digest = hashlib.sha1(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
+        prefix = f"{wid}-v{base}-{path}-{digest}-"
+        if any(p["proposal_id"].startswith(prefix) and isinstance(p["reasons"], dict)
+               and p["reasons"].get("error") == "invalid_config" for p in self.store.proposals(wid, ("failed",))):
+            return None
+        return prefix + str(self.store.count_proposals_with_prefix(prefix))
 
-        prompt_changed = proposed_config.get("prompt_version") != old_config.get(
-            "prompt_version"
-        )
-        if prompt_changed:
-            validation_id = (evidence or {}).get("validation_run_id")
-            if not validation_id:
-                raise ProposalPolicyError(
-                    "prompt changes require evidence.validation_run_id"
-                )
+    # ---- sending
+    def submit(self, wid: str, now: int, ts: str, changes: list):
+        """Sends this tick's wishes: all auto-applicable ones in one PUT, all others in one approval request
+        ('batch your changes'). Nothing auto-applies while an approval is pending (it would make it stale),
+        unless it is urgent."""
+        changes = [c for c in changes if c]
+        busy = self.in_flight(wid)
+        autos = [c for c in changes if c.path == "auto" and (c.urgent or not busy)]
+        if autos:
+            version, cfg = self.current(wid)
+            for c in autos:
+                c.edit(cfg)
+            self.auto_apply(wid, now, ts, version, cfg, summary=" | ".join(c.summary for c in autos),
+                            rationale=" | ".join(c.rationale for c in autos),
+                            evidence={c.name: c.evidence for c in autos})
+        approvals = [c for c in changes if c.path == "approval"]
+        if not approvals or self.in_flight(wid):
+            return
+        urgent = any(c.urgent for c in approvals)
+        if not self.can_request(wid, now, urgent=urgent)[0]:
+            return
+        version, cfg = self.current(wid)
+        for c in approvals:
+            c.edit(cfg)
+        diff = {}
+        for c in approvals:
+            diff.update(c.diff)
+        self.request(wid, now, ts, version, cfg, urgent=urgent,
+                     summary=" + ".join(c.summary for c in approvals),
+                     diff=diff, affected_leads=max(c.affected_leads for c in approvals),
+                     dry_run={c.name: c.dry_run for c in approvals},
+                     impact=max(c.impact for c in approvals),
+                     rationale=" | ".join(f"[{c.name}] {c.rationale}" for c in approvals),
+                     evidence={c.name: c.evidence for c in approvals})
 
-        ttl = governance.get("proposal_ttl_hours")
-        body: dict[str, Any] = {
-            "proposal_id": proposal_id,
-            "workflow_id": workflow["workflow_id"],
-            "base_version": int(base_version),
-            "proposed_config": proposed_config,
-            "change_summary": change_summary,
-            "diff": diff,
-            "affected_leads": int(affected_leads),
-            "dry_run": dry_run,
-            "impact_score": float(impact_score),
-            "rationale": rationale,
-        }
+    def request(self, wid: str, now: int, ts: str, base: int, config: dict, *, summary: str, diff: dict,
+                affected_leads: int, dry_run: dict, impact: float, rationale: str, evidence: dict | None = None,
+                urgent: bool = False):
+        pid = self._new_id(wid, base, "approval", config)
+        if pid is None:
+            return None
+        body = {"proposal_id": pid, "workflow_id": wid, "base_version": base, "proposed_config": config,
+                "change_summary": summary, "diff": diff, "affected_leads": int(affected_leads), "dry_run": dry_run,
+                "impact_score": round(min(max(float(impact), 0.0), 1.0), 3), "rationale": rationale}
         if evidence:
             body["evidence"] = evidence
-        if ttl is not None:
-            body["expires_in_hours"] = min(float(ttl), float(ttl))
-        return body
+        self.store.add_proposal(pid, wid, "approval", base, now, urgent, body)
+        self.store.log_decision(ts, wid, "proposal_created", summary,
+                                {"proposal_id": pid, "path": "approval", "urgent": urgent, "diff": diff,
+                                 "rationale": rationale, "dry_run": dry_run, "impact_score": body["impact_score"],
+                                 "affected_leads": body["affected_leads"]})
+        self._send_approval(pid, ts)
+        return pid
 
-    def _find_approval(
-        self, workflow_id: str, proposal_id: str, approvals: list[dict[str, Any]] | None = None
-    ) -> dict[str, Any] | None:
-        if approvals is None:
-            approvals = self.client.list_approvals(workflow_id=workflow_id)
-        for approval in approvals:
-            if approval.get("proposal_id") == proposal_id:
-                return approval
+    def auto_apply(self, wid: str, now: int, ts: str, base: int, config: dict, *, summary: str, rationale: str,
+                   evidence: dict | None = None):
+        pid = self._new_id(wid, base, "auto", config)
+        if pid is None:
+            return None
+        body = {"proposal_id": pid, "base_version": base, "proposed_config": config, "rationale": rationale,
+                "evidence": evidence or {}, "change_summary": summary}
+        self.store.add_proposal(pid, wid, "auto", base, now, False, body)
+        self.store.log_decision(ts, wid, "proposal_created", summary,
+                                {"proposal_id": pid, "path": "auto", "rationale": rationale, "evidence": evidence})
+        self._send_auto(pid, ts)
+        return pid
+
+    def _send_approval(self, pid: str, ts: str):
+        row = self.store.proposal(pid)
+        wid = row["workflow_id"]
+        status, resp = self.api.post("/approvals", row["body"])
+        if status == 200:
+            self.store.set_proposal(pid, status="pending", approval_id=resp["approval_id"])
+            self.store.log_decision(ts, wid, "approval_requested",
+                                    f"{resp['approval_id']} sent, expires {resp['expires_at'][:16]}",
+                                    {"proposal_id": pid, "approval_id": resp["approval_id"]})
+        elif status == 409 and resp.get("error") == "duplicate_proposal_id":
+            self._adopt_from_server(row, ts)
+        else:
+            self._close(pid, "stale" if resp.get("error") == "stale_base_version" else "failed", ts, resp)
+
+    def _send_auto(self, pid: str, ts: str):
+        row = self.store.proposal(pid)
+        wid = row["workflow_id"]
+        body = {k: v for k, v in row["body"].items() if k != "change_summary"}
+        status, resp = self.api.put(f"/workflows/{wid}/config", body)
+        if status == 200:
+            self._mark_applied(row, resp["version"], ts)
+        elif status == 409 and resp.get("error") == "duplicate_proposal_id":
+            version = self._version_with(wid, "proposal_id", pid)
+            if version:
+                self._mark_applied(row, version, ts)
+            else:
+                self._close(pid, "failed", ts, resp)
+        else:
+            self._close(pid, "stale" if resp.get("error") == "stale_base_version" else "failed", ts, resp)
+
+    # ---- every tick: follow up on requests
+    def tick(self, now: int, ts: str):
+        self._config_cache.clear()
+        for row in self.store.proposals(None, ("pending", "approved")):
+            if row["status"] == "pending":
+                status, a = self.api.get(f"/approvals/{row['approval_id']}")
+                if status != 200 or a["status"] == "pending":
+                    continue
+                if a["status"] != "approved":
+                    self._sync_status(row, a, ts)
+                    continue
+                self.store.set_proposal(row["proposal_id"], status="approved")
+                self.store.log_decision(ts, row["workflow_id"], "approval_approved",
+                                        f"{row['approval_id']} approved at {a['decided_at'][:16]}, "
+                                        f"apply by {a['apply_by'][:16]}", {"proposal_id": row["proposal_id"]})
+            self._apply(row, ts)
+
+    def _apply(self, row: dict, ts: str):
+        pid, wid = row["proposal_id"], row["workflow_id"]
+        version, _ = self.current(wid)
+        if version != row["base_version"]:
+            self._close(pid, "stale", ts, {"current_version": version, "note": "config changed since we asked"})
+            return
+        for check in self.checks:
+            reason = check(row)
+            if reason:
+                self._close(pid, "withdrawn", ts, {"note": reason})
+                return
+        self.store.set_proposal(pid, status="applying")
+        status, resp = self.api.post(f"/workflows/{wid}/apply", {"approval_id": row["approval_id"]})
+        if status == 200:
+            self._mark_applied(row, resp["version"], ts)
+        elif status == 410:
+            self._close(pid, "lapsed", ts, resp)
+        elif status == 409 and resp.get("error") == "not_approved":
+            self._adopt_from_server(row, ts)
+        else:
+            self._close(pid, "stale" if resp.get("error") == "stale_base_version" else "failed", ts, resp)
+
+    # ---- after a restart
+    def reconcile(self, ts: str):
+        for row in self.store.proposals(None, ("sending", "applying")):
+            self.store.log_decision(ts, row["workflow_id"], "reconcile",
+                                    f"finishing proposal left '{row['status']}' by a restart",
+                                    {"proposal_id": row["proposal_id"]})
+            if row["status"] == "applying":
+                self._adopt_from_server(row, ts)
+            elif row["path"] == "approval":
+                self._send_approval(row["proposal_id"], ts)
+            else:
+                self._send_auto(row["proposal_id"], ts)
+
+    # ---- helpers
+    def _adopt_from_server(self, row: dict, ts: str):
+        pid, wid = row["proposal_id"], row["workflow_id"]
+        found = [a for a in self.api.get_ok("/approvals", workflow_id=wid) if a["proposal_id"] == pid]
+        if not found:
+            self._close(pid, "failed", ts, {"note": "simulator has no record of this proposal"})
+            return
+        a = found[0]
+        if row["approval_id"] != a["approval_id"]:
+            self.store.set_proposal(pid, approval_id=a["approval_id"])
+            row["approval_id"] = a["approval_id"]
+        self._sync_status(row, a, ts)
+
+    def _sync_status(self, row: dict, a: dict, ts: str):
+        pid = row["proposal_id"]
+        if a["status"] == "applied":
+            self._mark_applied(row, self._version_with(row["workflow_id"], "approval_id", a["approval_id"]), ts)
+        elif a["status"] in ("pending", "approved"):
+            self.store.set_proposal(pid, status=a["status"])
+        else:
+            self._close(pid, a["status"], ts, a.get("reasons"))
+
+    def _version_with(self, wid: str, key: str, value: str):
+        for v in self.api.get_ok(f"/workflows/{wid}/config/history"):
+            if v[key] == value:
+                return v["version"]
         return None
 
-    def _approval_status(self, approval: dict[str, Any]) -> str:
-        return str(approval.get("status") or "pending")
+    def _mark_applied(self, row: dict, version, ts: str):
+        self._config_cache.pop(row["workflow_id"], None)
+        self.store.set_proposal(row["proposal_id"], status="applied", applied_version=version)
+        how = "auto-applied" if row["path"] == "auto" else f"applied via approval {row['approval_id']}"
+        self.store.log_decision(ts, row["workflow_id"], "applied",
+                                f"{how} as config v{version}: {row['body'].get('change_summary', '')}",
+                                {"proposal_id": row["proposal_id"], "version": version})
 
-    def _approval_id(self, approval: dict[str, Any]) -> str | None:
-        value = approval.get("approval_id")
-        return str(value) if value is not None else None
-
-    def _record_approval(
-        self,
-        proposal: dict[str, Any],
-        approval: dict[str, Any],
-        sim_ts: str,
-    ) -> dict[str, Any]:
-        proposal_id = proposal["proposal_id"]
-        workflow_id = proposal["workflow_id"]
-        status = self._approval_status(approval)
-        approval_id = self._approval_id(approval) or proposal.get("approval_id")
-        expires_ts = approval.get("expires_at") or proposal.get("expires_ts")
-        apply_by_ts = approval.get("apply_by") or proposal.get("apply_by_ts")
-        reasons = approval.get("reasons") or []
-        sent_ts = proposal.get("sent_ts") or approval.get("created_at") or sim_ts
-
-        now = _parse_ts(sim_ts)
-        expiry = _parse_ts(expires_ts)
-        if status == "pending" and now is not None and expiry is not None and now >= expiry:
-            status = "expired"
-            reasons = list(reasons) + ["proposal_ttl_elapsed"]
-
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            status,
-            approval_id,
-            proposal["base_version"],
-            proposal["body"],
-            proposal["created_ts"],
-            expires_ts,
-            apply_by_ts,
-            sim_ts,
-            sent_ts,
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            f"proposal_{status}",
-            f"approval {approval_id} is {status}",
-            {"approval_id": approval_id, "status": status, "reasons": reasons},
-        )
-        updated = self.store.get_proposal(proposal_id)
-        if status == "approved":
-            return self._apply_approved(updated, sim_ts)
-        return updated
-
-    def _apply_approved(self, proposal: dict[str, Any], sim_ts: str) -> dict[str, Any]:
-        proposal_id = proposal["proposal_id"]
-        workflow_id = proposal["workflow_id"]
-        approval_id = proposal.get("approval_id")
-        if not approval_id:
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "apply_skipped",
-                "approved proposal has no approval_id",
-                {},
-            )
-            return proposal
-
-        now = _parse_ts(sim_ts)
-        apply_by = _parse_ts(proposal.get("apply_by_ts"))
-        if now is not None and apply_by is not None and now > apply_by:
-            self.store.save_proposal(
-                proposal_id,
-                workflow_id,
-                "lapsed",
-                approval_id,
-                proposal["base_version"],
-                proposal["body"],
-                proposal["created_ts"],
-                proposal.get("expires_ts"),
-                proposal.get("apply_by_ts"),
-                sim_ts,
-            )
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "proposal_lapsed",
-                "apply window elapsed before applying",
-                {"approval_id": approval_id, "apply_by": proposal.get("apply_by_ts")},
-            )
-            return self.store.get_proposal(proposal_id)
-
-        try:
-            result = self.client.apply_approval(workflow_id, approval_id)
-        except SimError as exc:
-            if exc.status == 409 and _has_reason(exc.body, "stale_base_version"):
-                return self._handle_stale(proposal, sim_ts)
-            if exc.status in (404, 410):
-                self.store.save_proposal(
-                    proposal_id,
-                    workflow_id,
-                    "lapsed",
-                    approval_id,
-                    proposal["base_version"],
-                    proposal["body"],
-                    proposal["created_ts"],
-                    proposal.get("expires_ts"),
-                    proposal.get("apply_by_ts"),
-                    sim_ts,
-                )
-                self._audit(
-                    sim_ts,
-                    workflow_id,
-                    "proposal_lapsed",
-                    _reason_text(exc.body),
-                    {"approval_id": approval_id, "status": exc.status, "body": exc.body},
-                )
-                return self.store.get_proposal(proposal_id)
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "apply_error",
-                _reason_text(exc.body),
-                {"approval_id": approval_id, "status": exc.status, "body": exc.body},
-            )
-            return proposal
-
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            "applied",
-            approval_id,
-            proposal["base_version"],
-            proposal["body"],
-            proposal["created_ts"],
-            proposal.get("expires_ts"),
-            proposal.get("apply_by_ts"),
-            sim_ts,
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            "proposal_applied",
-            "approved config applied",
-            {"approval_id": approval_id, "response": result},
-        )
-        return self.store.get_proposal(proposal_id)
-
-    def _intended_dims(self, proposal: dict[str, Any]) -> set[str]:
-        diff = proposal.get("body", {}).get("diff") or {}
-        text = json.dumps(diff, ensure_ascii=False, sort_keys=True)
-        return {dim for dim in CHANGE_DIMS if dim in text}
-
-    def _merged_config(
-        self,
-        current_config: dict[str, Any],
-        proposed_config: dict[str, Any],
-        intended_dims: set[str],
-    ) -> dict[str, Any]:
-        merged = copy.deepcopy(current_config)
-        if intended_dims & set(DISTRIBUTION_DIMS):
-            proposed_alloc = proposed_config.get("allocations") or {}
-            merged_alloc = merged.setdefault("allocations", {})
-            for cohort_id, entry in proposed_alloc.items():
-                if not isinstance(entry, dict):
-                    continue
-                for dim in DISTRIBUTION_DIMS:
-                    if dim in intended_dims and dim in entry:
-                        merged_alloc.setdefault(str(cohort_id), {})[dim] = copy.deepcopy(
-                            entry[dim]
-                        )
-        for dim in ("prompt_version", "schedule", "cohorts"):
-            if dim in intended_dims and dim in proposed_config:
-                merged[dim] = copy.deepcopy(proposed_config[dim])
-        return merged
-
-    def _replan_from_current(
-        self,
-        proposal: dict[str, Any],
-        sim_ts: str,
-        current: dict[str, Any],
-        reason: str,
-    ) -> dict[str, Any]:
-        proposal_id = proposal["proposal_id"]
-        workflow_id = proposal["workflow_id"]
-        intended_dims = self._intended_dims(proposal)
-        if not intended_dims:
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "proposal_replan_skipped",
-                "proposal has no identifiable intended dimensions",
-                {"proposal_id": proposal_id},
-            )
-            return self.store.get_proposal(proposal_id)
-
-        new_base = int(current["version"])
-        merged_config = self._merged_config(
-            current["config"], proposal["body"]["proposed_config"], intended_dims
-        )
-        purpose = self._purpose_for(proposal_id)
-        new_id = self.proposal_id(workflow_id, new_base, merged_config, purpose)
-        body = dict(proposal["body"])
-        body["proposal_id"] = new_id
-        body["base_version"] = new_base
-        body["proposed_config"] = merged_config
-        self._remember_purpose(new_id, purpose)
-        self.store.set_meta(f"replanned_proposal:{proposal_id}", new_id)
-        self._audit(
-            sim_ts,
-            workflow_id,
-            "proposal_replanned",
-            reason,
-            {
-                "old_proposal_id": proposal_id,
-                "new_proposal_id": new_id,
-                "base_version": new_base,
-                "intended_dims": sorted(intended_dims),
-                "changed_dims_preserved": True,
-            },
-        )
-        self.store.save_proposal(
-            new_id,
-            workflow_id,
-            "intent",
-            None,
-            new_base,
-            body,
-            sim_ts,
-        )
-        return self._send_intent(
-            new_id,
-            workflow_id,
-            body,
-            sim_ts,
-            sim_ts,
-            depth=1,
-        )
-
-    def _handle_stale(
-        self, proposal: dict[str, Any], sim_ts: str, depth: int = 0
-    ) -> dict[str, Any]:
-        proposal_id = proposal["proposal_id"]
-        workflow_id = proposal["workflow_id"]
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            "stale",
-            proposal.get("approval_id"),
-            proposal["base_version"],
-            proposal["body"],
-            proposal["created_ts"],
-            proposal.get("expires_ts"),
-            proposal.get("apply_by_ts"),
-            sim_ts,
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            "proposal_stale",
-            "base_version changed before proposal completed",
-            {"proposal_id": proposal_id, "base_version": proposal["base_version"]},
-        )
-        if depth >= 1:
-            return self.store.get_proposal(proposal_id)
-
-        current = self.client.get_config(workflow_id)
-        return self._replan_from_current(
-            proposal,
-            sim_ts,
-            current,
-            "rebuilt proposal on current config while preserving its intended dimensions",
-        )
-
-    def process_supervisor_edits(self, sim_ts: str | None = None) -> list[dict[str, Any]]:
-        sim_ts = self._sim_ts(sim_ts)
-        results: list[dict[str, Any]] = []
-        for event in self.store.list_events("config_changed"):
-            seen_key = f"supervisor_event_seen:{event['event_id']}"
-            if self.store.get_meta(seen_key):
-                continue
-            payload = event.get("payload") or {}
-            if payload.get("actor") != "supervisor":
-                self.store.set_meta(seen_key, "1")
-                continue
-            workflow_id = payload.get("workflow_id") or event.get("workflow_id")
-            if not workflow_id:
-                self.store.set_meta(seen_key, "1")
-                continue
-            workflow_id = str(workflow_id)
-            version = int(payload.get("version") or 0)
-            changed_dims = [str(dim) for dim in payload.get("changed_dims") or []]
-            current = self.client.get_config(workflow_id)
-            current_version = int(current["version"])
-            old_version = version - 1 if version > 0 else None
-            self.store.set_meta(
-                f"supervisor_config:{workflow_id}",
-                {
-                    "version": current_version,
-                    "config": current["config"],
-                    "ts": sim_ts,
-                    "changed_dims": changed_dims,
-                },
-            )
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "supervisor_config_changed",
-                f"supervisor changed {', '.join(changed_dims) or 'config'} "
-                f"from v{old_version} to v{version}",
-                {
-                    "old_version": old_version,
-                    "new_version": version,
-                    "current_version": current_version,
-                    "changed_dims": changed_dims,
-                    "actor": "supervisor",
-                    "proposal_id": payload.get("proposal_id"),
-                    "approval_id": payload.get("approval_id"),
-                    "event_id": event["event_id"],
-                },
-            )
-
-            if "caller_id" in changed_dims and self.detector_reset is not None:
-                self.detector_reset(
-                    workflow_id,
-                    sim_ts,
-                    version,
-                    "supervisor edited caller_id allocations",
-                )
-
-            stale_proposals: list[dict[str, Any]] = []
-            for proposal in self.store.list_proposals(
-                workflow_id=workflow_id,
-                statuses=("intent", "queued", "pending", "approved"),
-            ):
-                if int(proposal["base_version"]) >= version:
-                    continue
-                self.store.save_proposal(
-                    proposal["proposal_id"],
-                    workflow_id,
-                    "stale",
-                    proposal.get("approval_id"),
-                    proposal["base_version"],
-                    proposal["body"],
-                    proposal["created_ts"],
-                    proposal.get("expires_ts"),
-                    proposal.get("apply_by_ts"),
-                    sim_ts,
-                    proposal.get("sent_ts"),
-                )
-                self._audit(
-                    sim_ts,
-                    workflow_id,
-                    "proposal_stale_supervisor_edit",
-                    f"supervisor config v{version} superseded proposal base "
-                    f"v{proposal['base_version']}",
-                    {
-                        "proposal_id": proposal["proposal_id"],
-                        "old_base_version": proposal["base_version"],
-                        "new_version": version,
-                        "changed_dims": changed_dims,
-                    },
-                )
-                stale_proposals.append(proposal)
-
-            replanned: list[str] = []
-            for proposal in stale_proposals:
-                intended_dims = self._intended_dims(proposal)
-                if intended_dims & set(changed_dims):
-                    self._audit(
-                        sim_ts,
-                        workflow_id,
-                        "proposal_replan_skipped",
-                        "supervisor edit touched the same dimension; evidence no longer holds",
-                        {
-                            "proposal_id": proposal["proposal_id"],
-                            "intended_dims": sorted(intended_dims),
-                            "changed_dims": changed_dims,
-                        },
-                    )
-                    continue
-                replanned_proposal = self._replan_from_current(
-                    proposal,
-                    sim_ts,
-                    current,
-                    "supervisor edit was on unrelated dimensions; merged intent onto new base",
-                )
-                replanned.append(replanned_proposal["proposal_id"])
-
-            results.append(
-                {
-                    "workflow_id": workflow_id,
-                    "old_version": old_version,
-                    "new_version": version,
-                    "changed_dims": changed_dims,
-                    "stale": [item["proposal_id"] for item in stale_proposals],
-                    "replanned": replanned,
-                }
-            )
-            self.store.set_meta(seen_key, "1")
-        return results
-
-    def _send_intent(
-        self,
-        proposal_id: str,
-        workflow_id: str,
-        body: dict[str, Any],
-        created_ts: str,
-        sim_ts: str,
-        depth: int = 0,
-    ) -> dict[str, Any]:
-        try:
-            response = self.client.request_approval(body)
-        except SimError as exc:
-            if exc.status == 409 and _has_reason(exc.body, "duplicate_proposal_id"):
-                approval = self._find_approval(workflow_id, proposal_id)
-                if approval is not None:
-                    self._audit(
-                        sim_ts,
-                        workflow_id,
-                        "proposal_duplicate_reconciled",
-                        "duplicate id matched an existing approval",
-                        {"proposal_id": proposal_id, "approval": approval},
-                    )
-                    proposal = self.store.get_proposal(proposal_id)
-                    return self._record_approval(proposal, approval, sim_ts)
-                self._audit(
-                    sim_ts,
-                    workflow_id,
-                    "proposal_duplicate_unmatched",
-                    "duplicate id returned but no approval was listed",
-                    {"proposal_id": proposal_id},
-                )
-                return self.store.get_proposal(proposal_id)
-            if exc.status == 409 and _has_reason(exc.body, "stale_base_version"):
-                proposal = self.store.get_proposal(proposal_id)
-                return self._handle_stale(proposal, sim_ts, depth=depth)
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "proposal_send_error",
-                _reason_text(exc.body),
-                {"proposal_id": proposal_id, "status": exc.status, "body": exc.body},
-            )
-            raise
-
-        crash_point(
-            "after_api_before_record",
-            {
-                "proposal_id": proposal_id,
-                "workflow_id": workflow_id,
-                "approval_id": self._approval_id(response),
-            },
-        )
-        approval_id = self._approval_id(response)
-        status = self._approval_status(response)
-        expires_ts = response.get("expires_at")
-        apply_by_ts = response.get("apply_by")
-        sent_ts = response.get("created_at") or sim_ts
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            status,
-            approval_id,
-            body["base_version"],
-            body,
-            created_ts,
-            expires_ts,
-            apply_by_ts,
-            sim_ts,
-            sent_ts,
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            f"proposal_{status}",
-            f"approval request returned {status}",
-            {"approval_id": approval_id, "status": status, "response": response},
-        )
-        proposal = self.store.get_proposal(proposal_id)
-        if status == "approved":
-            return self._apply_approved(proposal, sim_ts)
-        return proposal
-
-    def _maybe_send_existing(
-        self,
-        proposal: dict[str, Any],
-        sim_ts: str,
-        governance: dict[str, Any],
-    ) -> dict[str, Any]:
-        status = proposal["status"]
-        if status not in ("intent", "queued"):
-            return proposal
-        send_now, reason = self._send_decision(_parse_ts(sim_ts), governance)
-        if not send_now:
-            if status != "queued":
-                self.store.save_proposal(
-                    proposal["proposal_id"],
-                    proposal["workflow_id"],
-                    "queued",
-                    proposal.get("approval_id"),
-                    proposal["base_version"],
-                    proposal["body"],
-                    proposal["created_ts"],
-                    proposal.get("expires_ts"),
-                    proposal.get("apply_by_ts"),
-                    sim_ts,
-                    proposal.get("sent_ts"),
-                )
-                self._audit(
-                    sim_ts,
-                    proposal["workflow_id"],
-                    "proposal_queued",
-                    reason,
-                    {
-                        "proposal_id": proposal["proposal_id"],
-                        "approver_hours": governance.get("approver_hours"),
-                        "approver_latency_minutes": governance.get(
-                            "approver_latency_minutes"
-                        ),
-                        "proposal_ttl_hours": governance.get("proposal_ttl_hours"),
-                    },
-                )
-                return self.store.get_proposal(proposal["proposal_id"])
-            return proposal
-
-        max_requests = governance.get("max_requests_per_24h")
-        if (
-            max_requests is not None
-            and self.store.count_requests_24h(proposal["workflow_id"], sim_ts)
-            >= int(max_requests)
-        ):
-            self._audit(
-                sim_ts,
-                proposal["workflow_id"],
-                "proposal_rate_limited",
-                "24h request cap reached while queued",
-                {"proposal_id": proposal["proposal_id"], "cap": max_requests},
-            )
-            return proposal
-
-        self.store.save_proposal(
-            proposal["proposal_id"],
-            proposal["workflow_id"],
-            "intent",
-            proposal.get("approval_id"),
-            proposal["base_version"],
-            proposal["body"],
-            proposal["created_ts"],
-            proposal.get("expires_ts"),
-            proposal.get("apply_by_ts"),
-            sim_ts,
-            proposal.get("sent_ts"),
-        )
-        return self._send_intent(
-            proposal["proposal_id"],
-            proposal["workflow_id"],
-            proposal["body"],
-            proposal["created_ts"],
-            sim_ts,
-        )
-
-    def propose(
-        self,
-        workflow_id: str,
-        proposed_config: dict[str, Any],
-        purpose: str,
-        *,
-        sim_ts: str | None = None,
-        change_summary: str,
-        diff: Any,
-        affected_leads: int,
-        dry_run: Any,
-        impact_score: float,
-        rationale: str,
-        evidence: dict[str, Any] | None = None,
-        base_version: int | None = None,
-        old_config: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        sim_ts = self._sim_ts(sim_ts)
-        workflow = self.client.get_workflow(workflow_id)
-        governance = workflow.get("governance") or {}
-        current = self.client.get_config(workflow_id)
-        if old_config is None:
-            old_config = current["config"]
-        if base_version is None or int(base_version) != int(current["version"]):
-            base_version = int(current["version"])
-
-        proposal_id = self.proposal_id(
-            workflow_id, int(base_version), proposed_config, purpose
-        )
-        self._remember_purpose(proposal_id, purpose)
-        existing = self.store.get_proposal(proposal_id)
-        if existing is not None:
-            if existing["status"] in ("pending", "approved"):
-                self.reconcile_all(workflow_id=workflow_id, sim_ts=sim_ts)
-                return self.store.get_proposal(proposal_id) or existing
-            if existing["status"] in ("intent", "queued"):
-                return self._maybe_send_existing(existing, sim_ts, governance)
-            return existing
-
-        max_requests = governance.get("max_requests_per_24h")
-        if (
-            max_requests is not None
-            and self.store.count_requests_24h(workflow_id, sim_ts)
-            >= int(max_requests)
-        ):
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "proposal_rate_limited",
-                "24h request cap reached",
-                {
-                    "proposal_id": proposal_id,
-                    "cap": max_requests,
-                    "count": self.store.count_requests_24h(workflow_id, sim_ts),
-                },
-            )
-            raise RateLimitError(
-                f"{workflow_id} has reached {max_requests} requests in 24h"
-            )
-
-        body = self._make_body(
-            workflow,
-            proposal_id,
-            int(base_version),
-            proposed_config,
-            old_config,
-            change_summary,
-            diff,
-            affected_leads,
-            dry_run,
-            impact_score,
-            rationale,
-            evidence,
-        )
-
-        send_now, reason = self._send_decision(_parse_ts(sim_ts), governance)
-        if not send_now:
-            self.store.save_proposal(
-                proposal_id,
-                workflow_id,
-                "queued",
-                None,
-                int(base_version),
-                body,
-                sim_ts,
-                _add_hours(sim_ts, governance.get("proposal_ttl_hours")),
-                None,
-                sim_ts,
-            )
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "proposal_queued",
-                reason,
-                {
-                    "proposal_id": proposal_id,
-                    "approver_hours": governance.get("approver_hours"),
-                    "approver_latency_minutes": governance.get("approver_latency_minutes"),
-                    "proposal_ttl_hours": governance.get("proposal_ttl_hours"),
-                },
-            )
-            return self.store.get_proposal(proposal_id)
-
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            "intent",
-            None,
-            int(base_version),
-            body,
-            sim_ts,
-            _add_hours(sim_ts, governance.get("proposal_ttl_hours")),
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            "proposal_intent",
-            "intent recorded before API call",
-            {"proposal_id": proposal_id, "base_version": base_version},
-        )
-        crash_point(
-            "after_intent_before_api",
-            {"proposal_id": proposal_id, "workflow_id": workflow_id},
-        )
-        return self._send_intent(
-            proposal_id, workflow_id, body, sim_ts, sim_ts
-        )
-
-    def reconcile_all(
-        self, workflow_id: str | None = None, sim_ts: str | None = None
-    ) -> list[dict[str, Any]]:
-        sim_ts = self._sim_ts(sim_ts)
-        proposals = self.store.list_proposals(
-            workflow_id=workflow_id, statuses=NON_TERMINAL_STATUSES
-        )
-        by_workflow: dict[str, list[dict[str, Any]]] = {}
-        for proposal in proposals:
-            by_workflow.setdefault(proposal["workflow_id"], []).append(proposal)
-
-        reconciled: list[dict[str, Any]] = []
-        for wid, group in by_workflow.items():
-            workflow = self.client.get_workflow(wid)
-            governance = workflow.get("governance") or {}
-            approvals = self.client.list_approvals(workflow_id=wid)
-            for proposal in group:
-                approval = self._find_approval(wid, proposal["proposal_id"], approvals)
-                if approval is not None:
-                    reconciled.append(self._record_approval(proposal, approval, sim_ts))
-                    continue
-                if proposal["status"] in ("intent", "queued"):
-                    updated = self._maybe_send_existing(proposal, sim_ts, governance)
-                    reconciled.append(updated)
-                    continue
-                self._audit(
-                    sim_ts,
-                    wid,
-                    "reconcile_missing_approval",
-                    "non-terminal proposal not found in approval list",
-                    {"proposal_id": proposal["proposal_id"], "status": proposal["status"]},
-                )
-                reconciled.append(proposal)
-        return reconciled
-
-    def process(self, sim_ts: str | None = None) -> list[dict[str, Any]]:
-        return self.reconcile_all(sim_ts=sim_ts)
-
-    def _allocations(self, config: dict[str, Any], cohort_id: str, dim: str) -> dict[str, float]:
-        allocations = config.get("allocations") or {}
-        entry = allocations.get(cohort_id)
-        if not isinstance(entry, dict) or dim not in entry:
-            entry = allocations.get("default") or {}
-        distribution = entry.get(dim) if isinstance(entry, dict) else None
-        if not isinstance(distribution, dict):
-            return {}
-        return {str(k): float(v) for k, v in distribution.items()}
-
-    def _tv_distance(self, old: dict[str, float], new: dict[str, float]) -> float:
-        keys = set(old) | set(new)
-        old_total = sum(old.values())
-        new_total = sum(new.values())
-        total = 0.0
-        for key in keys:
-            old_p = old.get(key, 0.0) / old_total if old_total else 0.0
-            new_p = new.get(key, 0.0) / new_total if new_total else 0.0
-            total += abs(old_p - new_p)
-        return 0.5 * total
-
-    def _changed_dims(
-        self, old_cfg: dict[str, Any], new_cfg: dict[str, Any]
-    ) -> set[str]:
-        changed: set[str] = set()
-        if old_cfg.get("cohorts") != new_cfg.get("cohorts"):
-            changed.add("cohorts")
-        old_alloc = old_cfg.get("allocations") or {}
-        new_alloc = new_cfg.get("allocations") or {}
-        cohorts = set(old_alloc) | set(new_alloc)
-        for dim in DISTRIBUTION_DIMS:
-            for cohort_id in cohorts:
-                if self._allocations(old_cfg, cohort_id, dim) != self._allocations(
-                    new_cfg, cohort_id, dim
-                ):
-                    changed.add(dim)
-                    break
-        if old_cfg.get("prompt_version") != new_cfg.get("prompt_version"):
-            changed.add("prompt_version")
-        if old_cfg.get("schedule") != new_cfg.get("schedule"):
-            changed.add("schedule")
-        return changed
-
-    def auto_apply_allowed(
-        self,
-        workflow: dict[str, Any],
-        old_cfg: dict[str, Any],
-        new_cfg: dict[str, Any],
-    ) -> tuple[bool, list[str]]:
-        governance = workflow.get("governance") or {}
-        policy = governance.get("auto_apply") or {}
-        if not policy.get("enabled"):
-            return False, ["auto_apply is disabled"]
-        allowed = set(policy.get("allowed_dims") or [])
-        changed = self._changed_dims(old_cfg, new_cfg)
-        if not changed:
-            return False, ["no changed dimensions"]
-        blocked = sorted(changed - allowed)
-        if blocked:
-            return False, [f"dimensions not allowed: {', '.join(blocked)}"]
-
-        max_shift = float(policy.get("max_shift") or 0.0)
-        violations: list[str] = []
-        old_alloc = old_cfg.get("allocations") or {}
-        new_alloc = new_cfg.get("allocations") or {}
-        cohorts = set(old_alloc) | set(new_alloc)
-        for dim in DISTRIBUTION_DIMS:
-            if dim not in changed:
-                continue
-            for cohort_id in cohorts:
-                old_dist = self._allocations(old_cfg, cohort_id, dim)
-                new_dist = self._allocations(new_cfg, cohort_id, dim)
-                tv = self._tv_distance(old_dist, new_dist)
-                if tv > max_shift + 1e-9:
-                    violations.append(
-                        f"{cohort_id}.{dim} shift {tv:.3f} > max_shift {max_shift:.3f}"
-                    )
-        if violations:
-            return False, violations
-        return True, []
-
-    def try_auto_apply(
-        self,
-        workflow_id: str,
-        proposed_config: dict[str, Any],
-        *,
-        sim_ts: str | None = None,
-        purpose: str = "auto_apply",
-        rationale: str,
-        evidence: dict[str, Any] | None = None,
-        affected_leads: int = 0,
-    ) -> dict[str, Any]:
-        sim_ts = self._sim_ts(sim_ts)
-        workflow = self.client.get_workflow(workflow_id)
-        current = self.client.get_config(workflow_id)
-        allowed, reasons = self.auto_apply_allowed(
-            workflow, current["config"], proposed_config
-        )
-        if not allowed:
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "auto_apply_blocked",
-                "local policy check refused auto-apply",
-                {
-                    "reasons": reasons,
-                    "affected_leads": affected_leads,
-                    "combined_config": proposed_config,
-                },
-            )
-            return {"applied": False, "status": "blocked", "reasons": reasons}
-
-        proposal_id = self.proposal_id(
-            workflow_id, int(current["version"]), proposed_config, purpose
-        )
-        existing = self.store.get_proposal(proposal_id)
-        if existing is not None and existing["status"] == "applied":
-            return {"applied": True, "status": "applied", "proposal_id": proposal_id}
-        if existing is not None and existing["status"] == "intent":
-            body = existing["body"]
-            created_ts = existing["created_ts"]
-        else:
-            body = {
-                "proposal_id": proposal_id,
-                "base_version": int(current["version"]),
-                "proposed_config": proposed_config,
-                "rationale": rationale,
-            }
-            if evidence:
-                body["evidence"] = evidence
-            created_ts = sim_ts
-            self.store.save_proposal(
-                proposal_id,
-                workflow_id,
-                "intent",
-                None,
-                int(current["version"]),
-                body,
-                created_ts,
-            )
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "auto_apply_intent",
-                "intent recorded before auto-apply PUT",
-                {
-                    "proposal_id": proposal_id,
-                    "base_version": current["version"],
-                    "affected_leads": affected_leads,
-                },
-            )
-            crash_point(
-                "after_intent_before_api",
-                {"proposal_id": proposal_id, "workflow_id": workflow_id},
-            )
-
-        try:
-            result = self.client.put_config(workflow_id, body)
-        except SimError as exc:
-            if exc.status == 409 and _has_reason(exc.body, "stale_base_version"):
-                proposal = self.store.get_proposal(proposal_id)
-                return self._handle_stale(proposal, sim_ts)
-            status = "blocked" if exc.status == 403 else "error"
-            self.store.save_proposal(
-                proposal_id,
-                workflow_id,
-                status,
-                None,
-                int(body["base_version"]),
-                body,
-                created_ts,
-                updated_ts=sim_ts,
-            )
-            self._audit(
-                sim_ts,
-                workflow_id,
-                "auto_apply_error",
-                _reason_text(exc.body),
-                {"proposal_id": proposal_id, "status": exc.status, "body": exc.body},
-            )
-            return {"applied": False, "status": status, "reasons": [exc.body]}
-
-        crash_point(
-            "after_api_before_record",
-            {"proposal_id": proposal_id, "workflow_id": workflow_id},
-        )
-        self.store.save_proposal(
-            proposal_id,
-            workflow_id,
-            "applied",
-            None,
-            int(body["base_version"]),
-            body,
-            created_ts,
-            updated_ts=sim_ts,
-        )
-        self._audit(
-            sim_ts,
-            workflow_id,
-            "auto_apply_applied",
-            "auto-apply permitted by local policy check",
-            {"proposal_id": proposal_id, "response": result, "affected_leads": affected_leads},
-        )
-        return {"applied": True, "status": "applied", "proposal_id": proposal_id, "response": result}
+    def _close(self, pid: str, status: str, ts: str, reasons):
+        row = self.store.proposal(pid)
+        self.store.set_proposal(pid, status=status, reasons=reasons)
+        self.store.log_decision(ts, row["workflow_id"], f"proposal_{status}",
+                                f"{row['body'].get('change_summary', '')} -> {status}",
+                                {"proposal_id": pid, "reasons": reasons})
+        if isinstance(reasons, dict) and reasons.get("error") == "invalid_config":
+            self.store.log_decision(ts, row["workflow_id"], "alert",
+                                    f"controller bug: the simulator refused our config as invalid ({reasons.get('detail')}); "
+                                    f"it will not be resent. Look at the config builder for proposal {pid}.", reasons)
