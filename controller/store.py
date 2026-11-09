@@ -1,486 +1,232 @@
-"""SQLite persistence for ingested simulator events and controller audit records."""
-
-from __future__ import annotations
-
+"""The notebook: everything the controller knows lives in one SQLite file, so a restart picks up exactly where it stopped."""
 import json
-import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Callable, Iterable
 
+from .clock import minute_of
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "controller.db"
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workflows (workflow_id TEXT PRIMARY KEY, info TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS leads (
+  lead_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+  person_id TEXT NOT NULL, grp TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS call_counts (
+  workflow_id TEXT NOT NULL, day INTEGER NOT NULL, hour INTEGER NOT NULL,
+  config_version INTEGER NOT NULL, cohort_id TEXT NOT NULL,
+  welcome TEXT NOT NULL, voice TEXT NOT NULL, caller_id TEXT NOT NULL, prompt TEXT NOT NULL,
+  dials INTEGER NOT NULL, connected INTEGER NOT NULL, engaged INTEGER NOT NULL, halluc_flags INTEGER NOT NULL,
+  PRIMARY KEY (workflow_id, day, hour, config_version, cohort_id, welcome, voice, caller_id, prompt)
+);
+CREATE TABLE IF NOT EXISTS seg_counts (
+  workflow_id TEXT NOT NULL, day INTEGER NOT NULL, feature TEXT NOT NULL, value TEXT NOT NULL,
+  config_version INTEGER NOT NULL, cohort_id TEXT NOT NULL, welcome TEXT NOT NULL, voice TEXT NOT NULL,
+  dials INTEGER NOT NULL, connected INTEGER NOT NULL, engaged INTEGER NOT NULL,
+  PRIMARY KEY (workflow_id, day, feature, value, config_version, cohort_id, welcome, voice)
+);
+CREATE TABLE IF NOT EXISTS world_events (
+  event_id INTEGER PRIMARY KEY, type TEXT NOT NULL, workflow_id TEXT, ts TEXT NOT NULL, body TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, workflow_id TEXT, kind TEXT NOT NULL,
+  summary TEXT NOT NULL, details TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS loop_metrics (
+  sim_minute INTEGER PRIMARY KEY, wall_ts REAL NOT NULL, events INTEGER NOT NULL, chunks_behind INTEGER NOT NULL,
+  advance_s REAL NOT NULL, ingest_s REAL NOT NULL, decide_s REAL NOT NULL, credits REAL, rss_mb REAL
+);
+CREATE TABLE IF NOT EXISTS proposals (
+  proposal_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL,
+  base_version INTEGER NOT NULL, created_minute INTEGER NOT NULL, urgent INTEGER NOT NULL,
+  approval_id TEXT, applied_version INTEGER, reasons TEXT, body TEXT NOT NULL
+);
+"""
 
-SENT_PROPOSAL_STATUSES = (
-    "pending",
-    "approved",
-    "applied",
-    "rejected",
-    "expired",
-    "lapsed",
-    "stale",
+PROPOSAL_COLS = ("proposal_id", "workflow_id", "path", "status", "base_version", "created_minute", "urgent",
+                 "approval_id", "applied_version", "reasons", "body")
+
+COUNT_KEY = "workflow_id, day, hour, config_version, cohort_id, welcome, voice, caller_id, prompt"
+UPSERT_COUNTS = (
+    f"INSERT INTO call_counts ({COUNT_KEY}, dials, connected, engaged, halluc_flags) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+    f"ON CONFLICT ({COUNT_KEY}) DO UPDATE SET dials = dials + excluded.dials, "
+    "connected = connected + excluded.connected, engaged = engaged + excluded.engaged, "
+    "halluc_flags = halluc_flags + excluded.halluc_flags"
+)
+SEG_KEY = "workflow_id, day, feature, value, config_version, cohort_id, welcome, voice"
+UPSERT_SEG = (
+    f"INSERT INTO seg_counts ({SEG_KEY}, dials, connected, engaged) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+    f"ON CONFLICT ({SEG_KEY}) DO UPDATE SET dials = dials + excluded.dials, "
+    "connected = connected + excluded.connected, engaged = engaged + excluded.engaged"
 )
 
 
-def _resolve_db_path(path: str | Path | None = None) -> Path:
-    if path is not None:
-        return Path(path)
-    configured = os.environ.get("CONTROLLER_DB")
-    return Path(configured) if configured else DEFAULT_DB_PATH
-
-
 class Store:
-    """A single-file SQLite store with idempotent event ingestion and a cursor."""
+    def __init__(self, path: str):
+        self.path = path
+        self.db = sqlite3.connect(path)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.executescript(SCHEMA)
 
-    def __init__(self, path: str | Path | None = None):
-        self.path = _resolve_db_path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS "cursor" (
-                key TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                event_id INTEGER PRIMARY KEY,
-                type TEXT,
-                ts TEXT,
-                workflow_id TEXT,
-                payload TEXT
-            );
-            CREATE INDEX IF NOT EXISTS events_type_event_id
-                ON events (type, event_id);
-            CREATE TABLE IF NOT EXISTS audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sim_ts TEXT,
-                workflow_id TEXT,
-                kind TEXT,
-                reason TEXT,
-                evidence TEXT
-            );
-            CREATE TABLE IF NOT EXISTS counts (
-                workflow_id TEXT NOT NULL,
-                cohort_id TEXT NOT NULL,
-                dim TEXT NOT NULL,
-                variant TEXT NOT NULL,
-                hour_bucket TEXT NOT NULL,
-                dials INTEGER NOT NULL DEFAULT 0,
-                connected INTEGER NOT NULL DEFAULT 0,
-                engaged INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (workflow_id, cohort_id, dim, variant, hour_bucket)
-            );
-            CREATE INDEX IF NOT EXISTS counts_workflow_hour
-                ON counts (workflow_id, hour_bucket);
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS proposals (
-                proposal_id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                approval_id TEXT,
-                base_version INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                created_ts TEXT NOT NULL,
-                expires_ts TEXT,
-                apply_by_ts TEXT,
-                updated_ts TEXT NOT NULL,
-                sent_ts TEXT
-            );
-            CREATE INDEX IF NOT EXISTS proposals_workflow_status
-                ON proposals (workflow_id, status);
-            """
-        )
-        columns = {
-            row[1] for row in self.conn.execute("PRAGMA table_info(proposals)").fetchall()
-        }
-        if "sent_ts" not in columns:
-            self.conn.execute("ALTER TABLE proposals ADD COLUMN sent_ts TEXT")
-        self.conn.commit()
+    def close(self):
+        self.db.close()
 
-    def save_chunk(self, kind: str, chunk_no: int, events: Iterable[dict[str, Any]]) -> None:
-        if kind not in ("events", "history"):
-            raise ValueError(f"unknown chunk kind: {kind!r}")
+    def meta(self, key: str, default=None):
+        row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
 
-        def flush(batch: list[dict[str, Any]], final: bool) -> None:
-            with self.conn:
-                for event in batch:
-                    try:
-                        event_id = event["event_id"]
-                    except (KeyError, TypeError) as exc:
-                        raise ValueError("event is missing event_id") from exc
-                    inserted = self.conn.execute(
-                        "INSERT OR IGNORE INTO events "
-                        "(event_id, type, ts, workflow_id, payload) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (
-                            int(event_id),
-                            event.get("type"),
-                            event.get("ts"),
-                            event.get("workflow_id"),
-                            json.dumps(event, ensure_ascii=False, sort_keys=True),
-                        ),
-                    )
-                    if inserted.rowcount == 1 and event.get("type") == "call":
-                        self._upsert_counts(event)
-                if final:
-                    row = self.conn.execute(
-                        'SELECT value FROM "cursor" WHERE key = ?', (kind,)
-                    ).fetchone()
-                    if row is None or int(chunk_no) > int(row[0]):
-                        self.conn.execute(
-                            'INSERT INTO "cursor" (key, value) VALUES (?, ?) '
-                            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                            (kind, int(chunk_no)),
-                        )
+    def set_meta(self, key: str, value):
+        with self.db:
+            self._set_meta(key, value)
 
-        batch: list[dict[str, Any]] = []
-        for event in events:
-            batch.append(event)
-            if len(batch) >= 10_000:
-                flush(batch, False)
-                batch = []
-        flush(batch, True)
+    def _set_meta(self, key: str, value):
+        self.db.execute("INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (key, json.dumps(value)))
 
-    @staticmethod
-    def _hour_bucket(ts: Any) -> str:
-        if not ts:
-            return ""
-        try:
-            return datetime.fromisoformat(str(ts)).strftime("%Y-%m-%dT%H")
-        except ValueError:
-            return str(ts)[:13]
+    def last_chunk(self) -> int:
+        return self.meta("last_chunk", -1)
 
-    def _upsert_counts(self, event: dict[str, Any]) -> None:
-        workflow_id = event.get("workflow_id")
-        cohort_id = event.get("cohort_id") or "default"
-        variant = event.get("variant") or {}
-        hour_bucket = self._hour_bucket(event.get("ts"))
-        connected = 1 if event.get("connected") else 0
-        engaged = 1 if event.get("engaged") else 0
-        for dim in ("welcome_message", "voice", "caller_id", "prompt_version"):
-            value = variant.get(dim)
-            if value is None:
-                continue
-            self.conn.execute(
-                "INSERT INTO counts "
-                "(workflow_id, cohort_id, dim, variant, hour_bucket, dials, connected, engaged) "
-                "VALUES (?, ?, ?, ?, ?, 1, ?, ?) "
-                "ON CONFLICT(workflow_id, cohort_id, dim, variant, hour_bucket) "
-                "DO UPDATE SET "
-                "dials = dials + 1, "
-                "connected = connected + excluded.connected, "
-                "engaged = engaged + excluded.engaged",
-                (
-                    workflow_id,
-                    str(cohort_id),
-                    dim,
-                    str(value),
-                    hour_bucket,
-                    connected,
-                    engaged,
-                ),
-            )
+    def matches_world(self, state: dict) -> bool:
+        """False when this notebook was written against a different simulator run (a new world)."""
+        scenario = self.meta("scenario")
+        if scenario is None:
+            return True
+        return (scenario == state["scenario"]
+                and self.meta("last_sim_minute", 0) <= state["sim_minute"]
+                and self.last_chunk() < state["chunks"])
 
-    def hour_totals(
-        self, workflow_id: str, hour_bucket: str, dim: str = "caller_id"
-    ) -> dict[str, int]:
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(dials), 0), COALESCE(SUM(connected), 0), "
-            "COALESCE(SUM(engaged), 0) FROM counts "
-            "WHERE workflow_id = ? AND hour_bucket = ? AND dim = ?",
-            (workflow_id, hour_bucket, dim),
-        ).fetchone()
-        return {"dials": int(row[0]), "connected": int(row[1]), "engaged": int(row[2])}
+    def save_chunk(self, chunk_no: int, counts: dict, seg: dict, leads: list, world_events: list):
+        """All or nothing: a chunk's counts and the note 'chunk N is done' are committed together."""
+        with self.db:
+            self.db.executemany(UPSERT_COUNTS, [key + tuple(c) for key, c in counts.items()])
+            self.db.executemany(UPSERT_SEG, [key + tuple(c) for key, c in seg.items()])
+            self.db.executemany("INSERT OR IGNORE INTO leads VALUES (?,?,?,?,?)", leads)
+            self.db.executemany("INSERT OR IGNORE INTO world_events VALUES (?,?,?,?,?)", world_events)
+            self._set_meta("last_chunk", chunk_no)
 
-    def last_event_ts(self) -> str | None:
-        row = self.conn.execute(
-            "SELECT ts FROM events ORDER BY event_id DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row is not None else None
+    def save_metrics(self, row: tuple):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO loop_metrics VALUES (?,?,?,?,?,?,?,?,?)", row)
 
-    def max_event_id(self) -> int | None:
-        row = self.conn.execute("SELECT MAX(event_id) FROM events").fetchone()
-        return int(row[0]) if row is not None and row[0] is not None else None
+    def lead_group(self, lead_id: str):
+        row = self.db.execute("SELECT grp FROM leads WHERE lead_id = ?", (lead_id,)).fetchone()
+        return row[0] if row else None
 
-    def max_cursor(self) -> int | None:
-        row = self.conn.execute('SELECT MAX(value) FROM "cursor"').fetchone()
-        return int(row[0]) if row is not None and row[0] is not None else None
+    def save_workflows(self, workflows: list):
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO workflows VALUES (?, ?) ON CONFLICT(workflow_id) DO UPDATE SET info = excluded.info",
+                [(w["workflow_id"], json.dumps(w)) for w in workflows])
 
-    def save_proposal(
-        self,
-        proposal_id: str,
-        workflow_id: str,
-        status: str,
-        approval_id: str | None,
-        base_version: int,
-        body: dict[str, Any],
-        created_ts: str,
-        expires_ts: str | None = None,
-        apply_by_ts: str | None = None,
-        updated_ts: str | None = None,
-        sent_ts: str | None = None,
-    ) -> None:
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO proposals "
-                "(proposal_id, workflow_id, status, approval_id, base_version, body, "
-                "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(proposal_id) DO UPDATE SET "
-                "workflow_id = excluded.workflow_id, "
-                "status = excluded.status, "
-                "approval_id = COALESCE(excluded.approval_id, proposals.approval_id), "
-                "base_version = excluded.base_version, "
-                "body = excluded.body, "
-                "expires_ts = COALESCE(excluded.expires_ts, proposals.expires_ts), "
-                "apply_by_ts = COALESCE(excluded.apply_by_ts, proposals.apply_by_ts), "
-                "updated_ts = excluded.updated_ts, "
-                "sent_ts = COALESCE(excluded.sent_ts, proposals.sent_ts)",
-                (
-                    proposal_id,
-                    workflow_id,
-                    status,
-                    approval_id,
-                    int(base_version),
-                    json.dumps(body, ensure_ascii=False, sort_keys=True),
-                    created_ts,
-                    expires_ts,
-                    apply_by_ts,
-                    updated_ts or created_ts,
-                    sent_ts,
-                ),
-            )
+    def log_decision(self, ts: str, workflow_id, kind: str, summary: str, details: dict | None = None):
+        with self.db:
+            self.db.execute("INSERT INTO decisions (ts, workflow_id, kind, summary, details) VALUES (?,?,?,?,?)",
+                            (ts, workflow_id, kind, summary, json.dumps(details or {})))
 
-    @staticmethod
-    def _proposal_row(row: Any) -> dict[str, Any]:
-        return {
-            "proposal_id": row[0],
-            "workflow_id": row[1],
-            "status": row[2],
-            "approval_id": row[3],
-            "base_version": int(row[4]),
-            "body": json.loads(row[5]),
-            "created_ts": row[6],
-            "expires_ts": row[7],
-            "apply_by_ts": row[8],
-            "updated_ts": row[9],
-            "sent_ts": row[10],
-        }
+    # ---- proposals (every change the controller asks for or makes)
+    def add_proposal(self, pid: str, wid: str, path: str, base_version: int, now: int, urgent: bool, body: dict):
+        with self.db:
+            self.db.execute(
+                "INSERT INTO proposals (proposal_id, workflow_id, path, status, base_version, created_minute, urgent, body)"
+                " VALUES (?,?,?,?,?,?,?,?)", (pid, wid, path, "sending", base_version, now, int(urgent), json.dumps(body)))
 
-    def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
-            "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts "
-            "FROM proposals WHERE proposal_id = ?",
-            (proposal_id,),
-        ).fetchone()
-        return self._proposal_row(row) if row is not None else None
+    def set_proposal(self, pid: str, **fields):
+        if "reasons" in fields:
+            fields["reasons"] = json.dumps(fields["reasons"])
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self.db:
+            self.db.execute(f"UPDATE proposals SET {cols} WHERE proposal_id = ?", (*fields.values(), pid))
 
-    def list_proposals(
-        self, workflow_id: str | None = None, statuses: list[str] | tuple[str, ...] | None = None
-    ) -> list[dict[str, Any]]:
-        clauses = []
-        params: list[Any] = []
-        if workflow_id is not None:
-            clauses.append("workflow_id = ?")
-            params.append(workflow_id)
+    def proposals(self, wid: str | None = None, statuses: tuple | None = None) -> list[dict]:
+        sql, args = f"SELECT {', '.join(PROPOSAL_COLS)} FROM proposals WHERE 1=1", []
+        if wid:
+            sql += " AND workflow_id = ?"
+            args.append(wid)
         if statuses:
-            placeholders = ", ".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(statuses)
-        sql = (
-            "SELECT proposal_id, workflow_id, status, approval_id, base_version, body, "
-            "created_ts, expires_ts, apply_by_ts, updated_ts, sent_ts FROM proposals"
-        )
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_ts, proposal_id"
-        rows = self.conn.execute(sql, params).fetchall()
-        return [self._proposal_row(row) for row in rows]
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += list(statuses)
+        rows = []
+        for r in self.db.execute(sql + " ORDER BY created_minute, proposal_id", args):
+            d = dict(zip(PROPOSAL_COLS, r))
+            d["body"] = json.loads(d["body"])
+            d["reasons"] = json.loads(d["reasons"]) if d["reasons"] else None
+            rows.append(d)
+        return rows
 
-    def count_requests_24h(self, workflow_id: str, sim_now: str) -> int:
-        now = datetime.fromisoformat(str(sim_now))
-        cutoff = now - timedelta(hours=24)
-        placeholders = ", ".join("?" for _ in SENT_PROPOSAL_STATUSES)
-        rows = self.conn.execute(
-            "SELECT COALESCE(sent_ts, created_ts) FROM proposals "
-            f"WHERE workflow_id = ? AND status IN ({placeholders})",
-            (workflow_id, *SENT_PROPOSAL_STATUSES),
-        ).fetchall()
-        count = 0
-        for row in rows:
-            try:
-                created = datetime.fromisoformat(str(row[0]))
-            except ValueError:
-                continue
-            if created >= cutoff:
-                count += 1
-        return count
+    def proposal(self, pid: str) -> dict:
+        return next(p for p in self.proposals() if p["proposal_id"] == pid)
 
-    def set_meta(self, key: str, value: Any) -> None:
-        text = value if isinstance(value, str) else json.dumps(
-            value, ensure_ascii=False, sort_keys=True
-        )
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, text),
-            )
+    def count_proposals_with_prefix(self, prefix: str) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM proposals WHERE proposal_id LIKE ?",
+                               (prefix + "%",)).fetchone()[0]
 
-    def get_meta(self, key: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT value FROM meta WHERE key = ?", (key,)
-        ).fetchone()
-        return row[0] if row is not None else None
+    def requests_since(self, wid: str, minute: int) -> int:
+        """Approval requests the simulator registered for this workflow after `minute` (they all count to its limit)."""
+        return self.db.execute(
+            "SELECT COUNT(*) FROM proposals WHERE workflow_id = ? AND path = 'approval' "
+            "AND approval_id IS NOT NULL AND created_minute > ?", (wid, minute)).fetchone()[0]
 
-    def delete_meta_prefix(self, prefix: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "DELETE FROM meta WHERE key LIKE ?", (f"{prefix}%",)
-            )
+    # ---- questions the managers ask about the counts
+    def caller_stats(self, wid: str, since_hour: int, until_hour: int | None = None, min_version: int = 0) -> dict:
+        """{caller_id: (dials, connected)} for calls in absolute hours [since_hour, until_hour) (hour 0 = D0 00:00),
+        made under config version >= min_version."""
+        sql = ("SELECT caller_id, SUM(dials), SUM(connected) FROM call_counts WHERE workflow_id = ? AND day >= ? "
+               "AND day * 24 + hour >= ? AND config_version >= ?")
+        args = [wid, since_hour // 24 - 1, since_hour, min_version]
+        if until_hour is not None:
+            sql += " AND day * 24 + hour < ?"
+            args.append(until_hour)
+        return {d: (n, c) for d, n, c in self.db.execute(sql + " GROUP BY caller_id", args).fetchall()}
 
-    def list_events(
-        self, event_type: str, after_event_id: int | None = None
-    ) -> list[dict[str, Any]]:
-        sql = (
-            "SELECT event_id, type, ts, workflow_id, payload FROM events "
-            "WHERE type = ?"
-        )
-        params: list[Any] = [event_type]
-        if after_event_id is not None:
-            sql += " AND event_id > ?"
-            params.append(int(after_event_id))
-        sql += " ORDER BY event_id"
-        rows = self.conn.execute(sql, params).fetchall()
-        return [
-            {
-                "event_id": int(row[0]),
-                "type": row[1],
-                "ts": row[2],
-                "workflow_id": row[3],
-                "payload": json.loads(row[4]) if row[4] else {},
-            }
-            for row in rows
-        ]
+    def prompt_stats(self, wid: str, since_hour: int | None = None, history: bool = False) -> dict:
+        """{prompt: {connected, flags, engaged, last_hour}} for calls after `since_hour`, or during history only."""
+        sql = ("SELECT prompt, SUM(connected), SUM(halluc_flags), SUM(engaged), MAX(day * 24 + hour) "
+               "FROM call_counts WHERE workflow_id = ?")
+        args = [wid]
+        if history:
+            sql += " AND day < 0"
+        if since_hour is not None:
+            sql += " AND day >= ? AND day * 24 + hour >= ?"
+            args += [since_hour // 24 - 1, since_hour]
+        return {p: {"connected": c, "flags": f, "engaged": e, "last_hour": lh}
+                for p, c, f, e, lh in self.db.execute(sql + " GROUP BY prompt", args).fetchall()}
 
-    def record_world_fingerprint(self, state: dict[str, Any]) -> None:
-        fingerprint = {
-            key: state.get(key)
-            for key in ("scenario", "end_minute", "tick_minutes")
-        }
-        self.set_meta("world", fingerprint)
-        self.set_meta("last_state", state)
+    def arm_stats(self, wid: str, dim: str, since_hour: int = 0) -> list:
+        """[(stratum, option, connected, engaged)] for live calls since `since_hour`. A stratum is one config version
+        and cohort: inside it options were assigned at random, so they can be compared fairly."""
+        col = {"welcome_message": "welcome", "voice": "voice"}[dim]
+        sql = (f"SELECT config_version, cohort_id, {col}, SUM(connected), SUM(engaged) FROM call_counts "
+               f"WHERE workflow_id = ? AND day >= ? AND day * 24 + hour >= ? GROUP BY config_version, cohort_id, {col}")
+        return [((v, c), opt, n, e) for v, c, opt, n, e in
+                self.db.execute(sql, (wid, max(since_hour // 24 - 1, 0), since_hour))]
 
-    def world_reset_reason(self, state: dict[str, Any]) -> str | None:
-        current_last = state.get("last_event_id")
-        db_last = self.max_event_id()
-        if (
-            current_last is not None
-            and db_last is not None
-            and int(current_last) < db_last
-        ):
-            return f"sim last_event_id {current_last} < db max event_id {db_last}"
+    def segment_stats(self, wid: str, dim: str, since_day: int = 0) -> dict:
+        """{(feature, value): [(stratum, option, connected, engaged)]} for live calls since `since_day`."""
+        col = {"welcome_message": "welcome", "voice": "voice"}[dim]
+        out = {}
+        for f, val, v, c, opt, n, e in self.db.execute(
+                f"SELECT feature, value, config_version, cohort_id, {col}, SUM(connected), SUM(engaged) FROM seg_counts "
+                f"WHERE workflow_id = ? AND day >= ? GROUP BY feature, value, config_version, cohort_id, {col}",
+                (wid, since_day)):
+            out.setdefault((f, val), []).append(((v, c), opt, n, e))
+        return out
 
-        chunks = state.get("chunks")
-        db_cursor = self.max_cursor()
-        if chunks is not None and db_cursor is not None and int(chunks) < db_cursor:
-            return f"sim chunks {chunks} < db cursor {db_cursor}"
-        return None
+    def segment_sizes(self, wid: str) -> dict:
+        """{(feature, value): share of answered calls} over history: how big each group is."""
+        rows = self.db.execute("SELECT feature, value, SUM(connected) FROM seg_counts WHERE workflow_id = ? AND day < 0 "
+                               "GROUP BY feature, value", (wid,)).fetchall()
+        totals = {}
+        for f, _, n in rows:
+            totals[f] = totals.get(f, 0) + n
+        return {(f, v): n / totals[f] for f, v, n in rows if totals[f]}
 
-    def get_cursor(self, kind: str) -> int | None:
-        row = self.conn.execute(
-            'SELECT value FROM "cursor" WHERE key = ?', (kind,)
-        ).fetchone()
-        return int(row[0]) if row is not None else None
+    def active_leads(self, wid: str, now: int, cadence_days: int, d0) -> int:
+        """Leads in campaigns still inside their cadence (an upper bound on who a change can reach today)."""
+        return sum(ev["leads"] for ev in self.world_events(wid, "campaign_created", limit=cadence_days + 1)
+                   if now - minute_of(ev["ts"], d0) < cadence_days * 1440)
 
-    def write_audit(
-        self,
-        sim_ts: str | None,
-        workflow_id: str | None,
-        kind: str,
-        reason: str,
-        evidence: Any = None,
-    ) -> int:
-        if evidence is None or isinstance(evidence, str):
-            evidence_text = evidence
-        else:
-            evidence_text = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
-        with self.conn:
-            cursor = self.conn.execute(
-                "INSERT INTO audit (sim_ts, workflow_id, kind, reason, evidence) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (sim_ts, workflow_id, kind, reason, evidence_text),
-            )
-        return int(cursor.lastrowid)
-
-    def count_events(self) -> int:
-        return int(self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-
-    def close(self) -> None:
-        self.conn.close()
-
-    def __enter__(self) -> "Store":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
-
-
-def _archive_database(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    archive = path.with_name(f"{path.name}.{stamp}.bak")
-    for suffix in ("", "-wal", "-shm"):
-        source = Path(f"{path}{suffix}")
-        if source.exists():
-            source.replace(Path(f"{archive}{suffix}"))
-    return archive
-
-
-def open_store(
-    state: dict[str, Any],
-    path: str | Path | None = None,
-    log: Callable[[str], None] = print,
-) -> Store:
-    db_path = _resolve_db_path(path)
-    reset_reason: str | None = None
-    archive: Path | None = None
-
-    if db_path.exists():
-        existing = Store(db_path)
-        try:
-            reset_reason = existing.world_reset_reason(state)
-        finally:
-            existing.close()
-
-        if reset_reason is not None:
-            archive = _archive_database(db_path)
-            log(
-                f"[store] simulator reset detected ({reset_reason}); "
-                f"archived {db_path.name} -> {archive.name}"
-            )
-
-    store = Store(db_path)
-    store.record_world_fingerprint(state)
-    if reset_reason is not None:
-        store.write_audit(
-            state.get("ts"),
-            None,
-            "sim_reset",
-            reset_reason,
-            {"archive": str(archive), "state": state},
-        )
-        log(f"[store] starting fresh database at {store.path}")
-    else:
-        log(
-            f"[store] resuming database at {store.path} "
-            f"(history cursor={store.get_cursor('history')}, "
-            f"events cursor={store.get_cursor('events')})"
-        )
-    return store
+    def world_events(self, wid: str, kind: str, limit: int = 50) -> list[dict]:
+        rows = self.db.execute("SELECT body FROM world_events WHERE workflow_id = ? AND type = ? "
+                               "ORDER BY event_id DESC LIMIT ?", (wid, kind, limit)).fetchall()
+        return [json.loads(r[0]) for r in rows]

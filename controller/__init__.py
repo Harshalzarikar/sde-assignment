@@ -1,10 +1,1 @@
-"""Controller package for the outcome-loop simulator."""
-
-from .client import (
-    CreditsExhausted,
-    ScenarioFinished,
-    SimClient,
-    SimError,
-)
-
-__all__ = ["SimClient", "SimError", "ScenarioFinished", "CreditsExhausted"]
+"""Outcome-first controller: reads the simulator's events, keeps a crash-safe notebook, and (later) decides changes."""
