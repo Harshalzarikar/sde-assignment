@@ -170,6 +170,8 @@ Post-apply verification: after a 24-hour cooldown, recovery requires three windo
 
 Timeline from `public_02`:
 
+D0 = 2027-01-04, so D1 = 2027-01-05 and D2 = 2027-01-06.
+
 - D2 10:00: `did_flagged` on `ks_cancel`.
 - D2 16:00: controller detects `caller_id_degraded` for `D2`.
 - D2 17:00: `apr_00001` approved and applied; `ks_cancel` v2, `caller_id` only.
