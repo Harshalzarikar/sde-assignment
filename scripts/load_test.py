@@ -479,7 +479,7 @@ def _write_report(
         f"python -m controller.main http://127.0.0.1:<port> --db {root / 'controller.db'}{stop_arg}",
         "```",
         "",
-        f"No baseline run; {stop_note} One fresh simulator and one fresh controller DB.",
+        f"No baseline run. {stop_note} One fresh simulator and one fresh controller DB.",
         "",
         "## Run shape",
         "",
