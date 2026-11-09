@@ -1,6 +1,6 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** Harshal Zarikar | **Date:** 2026-11-09 | **Hours actually spent (be honest):** TODO (Harshal to supply honest estimate) | **Language / storage:** Python 3.13 standard library + SQLite
+**Name:** Harshal Zarikar | **Date:** 2026-11-09 | **Hours actually spent (be honest):** 12 hours | **Language / storage:** Python 3.13 standard library + SQLite
 
 ---
 
