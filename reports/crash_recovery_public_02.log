@@ -1,0 +1,21 @@
+simulator ready at http://127.0.0.1:64088 (1.6s)
+[2027-01-04T00:00] started: caught up on 187,250 events in 0.9s
+D0 done: 13,710 events in 0.8s (17,937 events/s)
+D1 done: 13,706 events in 0.9s (15,048 events/s)
+D2 done: 13,710 events in 1.0s (13,689 events/s)
+*** test crash at 2027-01-07T12:15 (after advancing, before reading the new events) ***
+
+*** controller exited with code 137 at the planned crash; restarting it ***
+
+[2027-01-07T12:15] resumed: caught up on 225 events in 0.0s
+D3 done: 7,679 events in 0.6s (12,605 events/s)
+D4 done: 13,709 events in 1.2s (11,454 events/s)
+D5 done: 13,705 events in 1.3s (10,913 events/s)
+D6 done: 13,705 events in 1.2s (11,671 events/s)
+D7 done: 13,707 events in 1.2s (11,488 events/s)
+D8 done: 13,707 events in 1.1s (12,188 events/s)
+D9 done: 13,703 events in 1.2s (11,716 events/s)
+scenario finished
+controller exit code 0, wall time 13.4s
+grade report: reports/public_02_crash.md
+count check: MATCH - the notebook agrees exactly with the simulator
