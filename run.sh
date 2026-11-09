@@ -6,11 +6,4 @@ set -euo pipefail
 SIM_URL="${1:?usage: ./run.sh <SIM_URL>}"
 cd "$(dirname "$0")"
 mkdir -p state
-if [ -n "${PYTHON:-}" ]; then
-  PY="$PYTHON"
-elif command -v python >/dev/null 2>&1; then
-  PY=python
-else
-  PY=python3
-fi
-exec "$PY" -m controller run --url "$SIM_URL" --db state/controller.db
+exec "${PYTHON:-python}" -m controller run --url "$SIM_URL" --db state/controller.db

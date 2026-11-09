@@ -1,6 +1,7 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** Harshal Zarikar · **Date:** 2026-11-09 · **Hours actually spent (be honest):** 15 hours · **Language / storage:** Python 3.10+ (only dependency: `httpx`, already in `requirements.txt`) / one SQLite file
+**Name:** Harshal Zarikar · **Date:** 2026-11-09 · **Hours actually spent (be honest):** 15 hours ·
+**Language / storage:** Python 3.10+ (only dependency: `httpx`, already in `requirements.txt`) / one SQLite file
 
 ---
 
@@ -70,7 +71,6 @@
 - **Accepted:** her edits are never undone silently. A supervisor edit to greeting or voice makes her choice the champion, pauses that dimension for 48h, and after that changes to it go only through approval. A bad script she ships is replaced only through an approval that carries evidence. At most 2 requests a day, none before 11:00 (`PREFERENCES` in `controller/governance.py`). Each tick's changes are batched into one request. "One screen" is `python -m controller supervisor --workflow ks_cancel`.
 - **Pushed back:** a safety incident (the agent saying false things) may use her policy's full limit and start at 10:00. I'd rather send a third request than leave a hallucinating script running until 11:00. "Tell me before anything changes": her company's policy auto-applies greeting, voice and caller-ID changes. She sees them on her screen under "changed today", but there is no channel to warn her *before*. Sending them all as approvals would break her 2-a-day limit.
 - **Real risk she named:** the "compliance script word for word" fix. The known-good path picks a script with a good live record on **both** safety and engagement. The LLM fallback, however, picks by validation pass rate, which measures safety only. It could pick P5 ("near-verbatim compliance script"). Listed in §13.
-- **Wrong against the policy:** none — her asks are preferences, not policy claims. But the policy does auto-apply Kestrel greeting, voice and caller-ID changes, so "tell me before anything changes" cannot be met for those dimensions without sending far more than two requests a day.
 - **Reply:** *Anita — we will never undo your script or voice changes ourselves. If a change you made turns out unsafe, you'll get one request with the evidence and you decide. Two requests a day, none before 11:00, everything batched into one. The exception: if a script starts making false claims, I'll ask from 10:00. Your screen shows what's being tested, what's winning, what we need from you and what changed today. Honest gap: your policy lets greeting/voice changes apply automatically in small steps, and today you see them after the fact, not before. If you want them as requests instead, say so and I'll switch.*
 
 ### 05 — Tara Kulkarni, Product
@@ -78,13 +78,11 @@
 - **Minimum size and window (her open question):** a group must be ≥ 5% of calls. A screen needs ≥ 100 answered calls per side; confirmation needs ≥ 100 *fresh* calls per side at z ≥ 2.5. Whole-workflow winners need ≥ 400 answered calls and z ≥ 3, plus the last-24h window. **Cost:** a typical winner takes 1.5–3 days. **Benefit:** 0 false winners in 4 no-effect worlds (~30 workflow-dimension experiments, ~60 group screens per hour).
 - **Pushed back:** three P0s are not P0. I built caller-ID health and the supervisor view. I cut per-person call time: I measured hour weights at ~2% pickup, against +25% from caller IDs. It is not a summit headline on the evidence I have.
 - **Caveat she should know:** the impact score is a heuristic (0.2 + 4 × expected engagement change, capped at 0.8; incidents 0.9–0.95). It ranks sensibly but is not calibrated.
-- **Wrong against the policy:** none. Her definitions match the contract exactly; the only disagreement is priority (per-person call time), which is a judgement call rather than a policy error.
 - **Reply:** *Tara — held to all your definitions: separate KPIs, one cohort id everywhere, all four proposal fields, expired = re-plan from fresh data, no learning from arms that never ran. Cohorts: ≥ 5% of calls and confirmation on fresh data. Whole-workflow winners: ≥ 400 answered calls at z ≥ 3. Cost: 1.5–3 days per winner. Benefit: zero false winners in four no-effect test worlds. I delivered caller-ID health and the supervisor view; I cut per-person call time, because I measured ~2% pickup from it versus +25% from caller IDs. The impact score is a heuristic today; calibrating it against measured lift is next.*
 
 ### 06 — Aryamann, CTO
 - **Accepted:** explainability over size. Every change has a plain-language summary, evidence and an audit answer. Credits went where they change a decision: 8 credits for the whole incident scenario, 0 LLM calls, because a known-good script existed. Choices and cuts are written down (§2). Docs are written for whoever gets paged (§10, §14).
 - **Where I disagreed with other memos:** listed above, each checked against `GET /workflows/{id}` policies, not recollection.
-- **Wrong against the policy:** none in this memo. He is right that others are: memos 01 and 02 each contain one claim the policies contradict (Kestrel "auto-apply everything"; Northwind KYC auto-apply), documented above.
 - **Reply:** *Aryamann — outcomes: +12%, +30% and +20% leads concluded on the three public worlds, zero harmful changes, a 90-minute incident fix for 8 credits, zero false winners in no-effect worlds. I said no to Sales on blended scores and lunchtime winners, to Product on per-person call time, and to Anita on waiting until 11:00 during a safety incident. Two memo claims contradicted the policies (Kestrel "auto-apply everything", Northwind KYC auto-apply). What breaks first at scale: lead storage and the single-writer store, then serial per-workflow decisions. The fix is sharding by workflow onto Postgres (§8).*
 
 ## 4. Architecture
@@ -159,7 +157,7 @@
 - **public_02 caller ID (ks_cancel):** D2 flagged at 10:00. At 11:00 the controller logged "D2 pickup suddenly dropped to 6.4% vs 27.3% on the other numbers in the last hour (140 dials, z=−3.34)" and moved D2's calls away (urgent auto-apply). The flagged number's share was 5.9% on that day and 0% every day after.
 
 ## 8. Scale
-Measured on public_03_load (12 workflows, ~840k events/day, all 5 days), on the reference macOS laptop (**not** the 4-vCPU/8-GB Linux box and not the submission machine):
+Measured on public_03_load (12 workflows, ~840k events/day, all 5 days), on a macOS laptop (**not** the 4-vCPU/8-GB Linux box):
 
 | day | events | wall s (total) | simulator s | ingest s | decide s | ingest events/s | worst tick s | peak RSS |
 |---|---|---|---|---|---|---|---|---|
@@ -228,8 +226,6 @@ Other commands: `supervisor --workflow X` (one screen), `status` (proposals, cal
 23 changes applied: 16 neutral, 7 beneficial, **0 harmful**. 15 requests, 12 approved, 3 judgement-call rejections, 0 expired/lapsed. 8 credits.
 
 **public_03** (load): conclusion **+20.4%**, pickup +12.1%, engagement +5.2%, 28% of engagement headroom. 96 changes, 57 neutral, 39 beneficial, **0 harmful**. 0 guardrail alerts.
-
-**Re-verified on the submission machine:** public_01 **+13.4%** and public_02 **+30.6%** leads concluded, both with `count check: MATCH` and **0 harmful** changes. The small deltas from the reference reports above are expected run-to-run variation.
 
 **Interpretation.**
 - **Where it helped:** pickup, mostly from spreading calls over more caller IDs (less load degradation), adding unused numbers through trials and dropping flagged ones. That gave +25–31% pickup on KYC. On engagement workflows: greeting/voice winners and group rules (e.g. voice V3 for 60+). On public_02, the 90-min script fix removed most of the hallucinated calls (164 vs 431 baseline).
