@@ -81,7 +81,7 @@ def _log_ingest(
     lag = _lag_text(state.get("ts"), store.last_event_ts()) if count else "n/a"
     print(
         f"[ingest:{label}] sim={state.get('ts')} chunks={by_kind} events={count} "
-        f"events_per_sec={rate:.0f} lag={lag}",
+        f"seconds={elapsed:.3f} events_per_sec={rate:.0f} lag={lag}",
         flush=True,
     )
 

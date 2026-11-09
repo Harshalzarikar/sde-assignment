@@ -24,6 +24,7 @@ from controller.client import SimClient  # noqa: E402
 
 INGEST_RE = re.compile(
     r"\[ingest:(?P<label>[^\]]+)\].*?events=(?P<events>\d+)\s+"
+    r"seconds=(?P<seconds>[0-9.]+)\s+"
     r"events_per_sec=(?P<rate>[0-9.]+)\s+lag=(?P<lag>\S+)"
 )
 TICK_RE = re.compile(
@@ -118,6 +119,31 @@ def _warn_existing_simulators() -> None:
         )
         for line in existing:
             print(f"  {line}", flush=True)
+
+
+def _prevent_sleep() -> int | None:
+    if os.name != "nt":
+        return None
+    es_continuous = 0x80000000
+    es_system_required = 0x00000001
+    es_display_required = 0x00000002
+    try:
+        previous = ctypes.windll.kernel32.SetThreadExecutionState(
+            es_continuous | es_system_required | es_display_required
+        )
+    except OSError:
+        return None
+    print("[power] keeping the machine awake for this run", flush=True)
+    return int(previous) if previous is not None else None
+
+
+def _allow_sleep(previous: int | None) -> None:
+    if os.name != "nt":
+        return
+    es_continuous = 0x80000000
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        previous if previous is not None else es_continuous
+    )
 
 
 def _env() -> dict[str, str]:
@@ -307,6 +333,7 @@ def _parse_log(path: Path) -> dict[str, object]:
                 {
                     "label": match.group("label"),
                     "events": int(match.group("events")),
+                    "seconds": float(match.group("seconds")),
                     "rate": float(match.group("rate")),
                     "lag_seconds": lag_seconds,
                 }
@@ -339,11 +366,16 @@ def _parse_log(path: Path) -> dict[str, object]:
         "event_tick_count": len(event_tick_rows),
         "idle_tick_count": len(tick_rows) - len(event_tick_rows),
         "tick_rates": [float(row["rate"]) for row in tick_rows],
+        "event_tick_rates": [float(row["rate"]) for row in event_tick_rows],
         "tick_durations": tick_durations,
         "tick_profiles": tick_profiles,
         "max_lag_seconds": max(lag_values) if lag_values else None,
         "final_lag_seconds": lag_values[-1] if lag_values else None,
     }
+
+
+def _file_size(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
 
 
 def _db_size(path: Path) -> int:
@@ -352,6 +384,10 @@ def _db_size(path: Path) -> int:
         for suffix in ("", "-wal", "-shm")
         if Path(f"{path}{suffix}").exists()
     )
+
+
+def _mb_text(value: object) -> str:
+    return "not measured" if value is None else f"{float(value):.1f} MB"
 
 
 def _write_report(
@@ -396,8 +432,44 @@ def _write_report(
         if stop_after_minutes is not None
         else "No early stop."
     )
+    if stop_after_minutes == 1440:
+        title = f"# Load report — {scenario.stem}: 1 simulated day of 5"
+    elif stop_after_minutes is not None:
+        title = (
+            f"# Load report — {scenario.stem}: "
+            f"{stop_after_minutes} simulated minutes of 5 days"
+        )
+    else:
+        title = f"# Load report — {scenario.stem}"
+    mean_live = metrics["mean_live_rate"]
+    peak_live = metrics["peak_live_rate"]
+    live_rate_value = (
+        "n/a (no live-event ticks)"
+        if mean_live is None
+        else f"mean {float(mean_live):.0f} events/s; peak {float(peak_live):.0f} events/s"
+    )
+    history_share = (
+        float(metrics["history_preload_seconds"])
+        / float(metrics["controller_wall_seconds"])
+        * 100.0
+        if float(metrics["controller_wall_seconds"]) > 0
+        else 0.0
+    )
+    finish_text = (
+        "Run finished the full scenario."
+        if state.get("finished")
+        else (
+            "Run did not finish the 5-day scenario"
+            + (
+                f"; it stopped at simulated minute {state.get('sim_minute')} "
+                f"by --stop-after-minutes {stop_after_minutes}."
+                if stop_after_minutes is not None
+                else "."
+            )
+        )
+    )
     lines = [
-        f"# Load report — {scenario.stem}",
+        title,
         "",
         "## Exact commands",
         "",
@@ -409,23 +481,34 @@ def _write_report(
         "",
         f"No baseline run; {stop_note} One fresh simulator and one fresh controller DB.",
         "",
-        "## Controller load",
+        "## Run shape",
         "",
         "| Metric | Value |",
         "|---|---|",
-        f"| Events ingested | {metrics['total_events']} |",
-        f"| Controller wall time | {metrics['wall_seconds']:.1f} s |",
-        f"| Overall ingest rate | {metrics['overall_rate']:.0f} events/s |",
-        f"| Mean per-tick ingest rate | {metrics['mean_tick_rate']:.0f} events/s |",
-        f"| Peak per-tick ingest rate | {metrics['peak_tick_rate']:.0f} events/s |",
-        f"| Mean tick duration | {metrics['mean_tick_seconds'] * 1000:.2f} ms |",
-        f"| Slowest tick duration | {metrics['slowest_tick_seconds'] * 1000:.2f} ms |",
-        f"| Event-ingesting ticks | {metrics['event_tick_count']} |",
+        f"| Simulator startup (health) | {float(metrics['simulator_startup_seconds']):.1f} s |",
+        f"| Controller wall time, including preload | {float(metrics['controller_wall_seconds']):.1f} s |",
+        f"| History preload events | {metrics['history_preload_events']} |",
+        f"| History preload wall time | {float(metrics['history_preload_seconds']):.1f} s |",
+        f"| History preload rate | {float(metrics['history_preload_rate']):.0f} events/s |",
+        f"| History preload share of controller wall | {history_share:.1f}% |",
+        f"| Steady-state ticks | {metrics['tick_count']} |",
+        f"| Steady-state wall for ticks | {float(metrics['steady_state_seconds']):.1f} s "
+        f"({float(metrics['steady_state_minutes']):.2f} min) |",
+        f"| 10-minute steady-state target | "
+        f"{'met' if metrics['target_10_min_met'] else 'not met'} |",
+        f"| Live events ingested | {metrics['live_events']} |",
+        f"| Live-event ticks | {metrics['event_tick_count']} |",
         f"| Idle ticks | {metrics['idle_tick_count']} |",
-        f"| Max ingest lag (event ticks) | {_lag_text(metrics['max_lag_seconds'])} |",
-        f"| Final ingest lag (event ticks) | {_lag_text(metrics['final_lag_seconds'])} |",
-        f"| Peak controller working set | {metrics['peak_memory_mb']:.1f} MB |",
-        f"| Final DB size | {metrics['db_size_mb']:.1f} MB |",
+        f"| Live-event ingest rate | {live_rate_value} |",
+        f"| Mean tick duration | {float(metrics['mean_tick_seconds']) * 1000.0:.2f} ms |",
+        f"| Slowest tick duration | {float(metrics['slowest_tick_seconds']) * 1000.0:.2f} ms |",
+        f"| Max ingest lag (live-event ticks) | {_lag_text(metrics['max_lag_seconds'])} |",
+        f"| Final ingest lag (live-event ticks) | {_lag_text(metrics['final_lag_seconds'])} |",
+        f"| Peak controller working set | {_mb_text(metrics['peak_memory_mb'])} |",
+        f"| Final DB file | {float(metrics['db_main_mb']):.1f} MB |",
+        f"| Final WAL | {float(metrics['wal_mb']):.1f} MB |",
+        f"| Final SHM | {float(metrics['shm_mb']):.1f} MB |",
+        f"| Final DB + WAL + SHM | {float(metrics['db_total_mb']):.1f} MB |",
         f"| Simulated finish | minute {state.get('sim_minute')} of {state.get('end_minute')} |",
         "",
         "## Tick phase breakdown",
@@ -463,7 +546,9 @@ def _write_report(
         f"Largest chunk overall: {largest[0]} events, "
         f"{largest_bytes / 1024.0:.1f} KB ({largest[1]} chunk {largest[2]}).",
         "",
-        "## Interpretation",
+        "## Measured analysis",
+        "",
+        finish_text,
         "",
         metrics["interpretation"],
         "",
@@ -517,61 +602,74 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[scenario] {scenario}")
     print(f"[runs] {root}")
     _warn_existing_simulators()
-    sim_log = (root / "sim.log").open("w", encoding="utf-8")
-    sim_process = subprocess.Popen(
-        [
-            python,
-            "-m",
-            "sim",
-            "serve",
-            "--scenario",
-            str(scenario),
-            "--run-dir",
-            str(sim_dir),
-            "--port",
-            str(port),
-        ],
-        cwd=str(ROOT),
-        env=_env(),
-        stdout=sim_log,
-        stderr=subprocess.STDOUT,
-    )
+    sleep_previous = _prevent_sleep()
     try:
-        startup_seconds = _wait_for_health(
-            sim_process, url, root / "sim.log"
+        sim_log = (root / "sim.log").open("w", encoding="utf-8")
+        sim_process = subprocess.Popen(
+            [
+                python,
+                "-m",
+                "sim",
+                "serve",
+                "--scenario",
+                str(scenario),
+                "--run-dir",
+                str(sim_dir),
+                "--port",
+                str(port),
+            ],
+            cwd=str(ROOT),
+            env=_env(),
+            stdout=sim_log,
+            stderr=subprocess.STDOUT,
         )
-        print("[controller] running")
-        code, wall_seconds, peak_mb = _run_controller(
-            python,
-            url,
-            db_path,
-            log_path,
-            stop_after_minutes=args.stop_after_minutes,
-        )
-        if code != 0:
-            raise SystemExit(f"controller failed: {code}")
-        client = SimClient(url, timeout=60, retries=3)
-        state = client.get_state()
-        chunks = {
-            kind: client.list_chunks(kind=kind)
-            for kind in ("history", "events")
-        }
+        try:
+            startup_seconds = _wait_for_health(
+                sim_process, url, root / "sim.log"
+            )
+            print("[controller] running")
+            code, wall_seconds, peak_mb = _run_controller(
+                python,
+                url,
+                db_path,
+                log_path,
+                stop_after_minutes=args.stop_after_minutes,
+            )
+            if code != 0:
+                raise SystemExit(f"controller failed: {code}")
+            client = SimClient(url, timeout=60, retries=3)
+            state = client.get_state()
+            chunks = {
+                kind: client.list_chunks(kind=kind)
+                for kind in ("history", "events")
+            }
+        finally:
+            if sim_process.poll() is None:
+                sim_process.terminate()
+                try:
+                    sim_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    sim_process.kill()
+                    sim_process.wait(timeout=10)
+            sim_log.close()
     finally:
-        if sim_process.poll() is None:
-            sim_process.terminate()
-            try:
-                sim_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                sim_process.kill()
-                sim_process.wait(timeout=10)
-        sim_log.close()
+        _allow_sleep(sleep_previous)
 
     parsed = _parse_log(log_path)
-    total_events = sum(int(row["events"]) for row in parsed["ingest"])
+    startup_rows = [
+        row for row in parsed["ingest"] if row["label"] == "startup"
+    ]
+    startup = startup_rows[0] if startup_rows else {}
+    tick_rows = [row for row in parsed["ingest"] if row["label"] == "tick"]
+    history_events = int(startup.get("events", 0))
+    history_seconds = float(startup.get("seconds", 0.0))
+    history_rate = history_events / history_seconds if history_seconds > 0 else 0.0
+    live_events = sum(int(row["events"]) for row in tick_rows)
+    live_rates = [float(value) for value in parsed["event_tick_rates"]]
     tick_durations = list(parsed["tick_durations"])
-    tick_rates = list(parsed["tick_rates"])
     tick_profiles = list(parsed["tick_profiles"])
     idle_profiles = [row for row in tick_profiles if int(row["events"]) == 0]
+    steady_state_seconds = sum(float(row["duration"]) for row in tick_profiles)
     phase_keys = (
         "duration",
         "state",
@@ -581,47 +679,105 @@ def main(argv: list[str] | None = None) -> int:
         "detect",
         "governance",
     )
+    phase_all = {key: _mean_phase_ms(tick_profiles, key) for key in phase_keys}
+    phase_idle = {key: _mean_phase_ms(idle_profiles, key) for key in phase_keys}
     metrics = {
-        "total_events": total_events,
-        "wall_seconds": wall_seconds,
-        "overall_rate": total_events / wall_seconds if wall_seconds > 0 else 0.0,
-        "mean_tick_rate": sum(tick_rates) / len(tick_rates) if tick_rates else 0.0,
-        "peak_tick_rate": max(tick_rates) if tick_rates else 0.0,
+        "simulator_startup_seconds": startup_seconds,
+        "controller_wall_seconds": wall_seconds,
+        "history_preload_events": history_events,
+        "history_preload_seconds": history_seconds,
+        "history_preload_rate": history_rate,
+        "live_events": live_events,
+        "tick_count": len(tick_profiles),
+        "event_tick_count": parsed["event_tick_count"],
+        "idle_tick_count": parsed["idle_tick_count"],
+        "steady_state_seconds": steady_state_seconds,
+        "steady_state_minutes": steady_state_seconds / 60.0,
         "mean_tick_seconds": (
             sum(tick_durations) / len(tick_durations) if tick_durations else 0.0
         ),
         "slowest_tick_seconds": max(tick_durations) if tick_durations else 0.0,
-        "event_tick_count": parsed["event_tick_count"],
-        "idle_tick_count": parsed["idle_tick_count"],
+        "mean_live_rate": sum(live_rates) / len(live_rates) if live_rates else None,
+        "peak_live_rate": max(live_rates) if live_rates else None,
         "max_lag_seconds": parsed["max_lag_seconds"],
         "final_lag_seconds": parsed["final_lag_seconds"],
-        "peak_memory_mb": peak_mb or 0.0,
-        "db_size_mb": _db_size(db_path) / (1024.0 * 1024.0),
+        "peak_memory_mb": peak_mb,
+        "db_main_mb": _file_size(db_path) / (1024.0 * 1024.0),
+        "wal_mb": _file_size(Path(f"{db_path}-wal")) / (1024.0 * 1024.0),
+        "shm_mb": _file_size(Path(f"{db_path}-shm")) / (1024.0 * 1024.0),
+        "db_total_mb": _db_size(db_path) / (1024.0 * 1024.0),
         "profile_tick_count": len(tick_profiles),
         "profile_idle_count": len(idle_profiles),
-        "phase_all_ms": {
-            key: _mean_phase_ms(tick_profiles, key) for key in phase_keys
-        },
-        "phase_idle_ms": {
-            key: _mean_phase_ms(idle_profiles, key) for key in phase_keys
-        },
+        "phase_all_ms": phase_all,
+        "phase_idle_ms": phase_idle,
+        "target_10_min_met": steady_state_seconds / 60.0 <= 10.0,
     }
-    lag = metrics["max_lag_seconds"]
-    slow = metrics["slowest_tick_seconds"]
-    if lag is not None and lag > 3600:
-        metrics["interpretation"] = (
-            "The controller fell behind by more than one simulated hour at the worst tick; "
-            "profile before tuning."
+    phase_labels = {
+        "advance": "POST /sim/advance",
+        "ingest": "ingest",
+        "supervisor": "supervisor edits",
+        "detect": "detect",
+        "governance": "governance",
+        "state": "state reads",
+    }
+    dominant_key = max(phase_labels, key=lambda key: phase_all.get(key, 0.0))
+    dominant_label = phase_labels[dominant_key]
+    dominant_ms = phase_all.get(dominant_key, 0.0)
+    advance_ms = phase_all.get("advance", 0.0)
+    controller_ms = sum(
+        phase_all.get(key, 0.0)
+        for key in ("state", "ingest", "supervisor", "detect", "governance")
+    )
+    changes = {
+        "advance": (
+            "the simulator advance dominates; a controller-side change would not "
+            "address the measured cost"
+        ),
+        "ingest": (
+            "keep 10k-row chunk transactions and, if chunk fetch memory is still "
+            "high, stream the JSON chunk instead of materializing it"
+        ),
+        "supervisor": (
+            "track the last processed config_changed event_id and keep an "
+            "events(type, event_id) index instead of rescanning every tick"
+        ),
+        "detect": (
+            "bound detector work to the current window instead of repeatedly "
+            "scanning stored history"
+        ),
+        "governance": "keep proposal reconciliation bounded to non-terminal rows",
+        "state": "cache the state/workflow reads used within one tick",
+    }
+    live_rate_text = (
+        "no live-event ticks"
+        if metrics["mean_live_rate"] is None
+        else (
+            f"mean {metrics['mean_live_rate']:.0f} events/s and peak "
+            f"{metrics['peak_live_rate']:.0f} events/s"
         )
-    elif slow > 2.0:
-        metrics["interpretation"] = (
-            "No sustained lag was observed, but at least one tick took over two seconds. "
-            "Treat that tick as the first profiling target."
+    )
+    ten_x = (
+        "No live-event ticks were observed, so a 10x live-event claim is not "
+        "supported by this run."
+        if metrics["mean_live_rate"] is None
+        else (
+            f"At 10x the measured live-event rate ({live_rate_text}), linear "
+            f"extrapolation puts the first pressure on {dominant_label}: "
+            f"{dominant_ms:.1f} ms/tick becomes roughly {dominant_ms * 10:.0f} ms/tick. "
+            "This is an extrapolation, not a measured 10x run."
         )
-    else:
-        metrics["interpretation"] = (
-            "The controller kept up: ingest lag stayed bounded and no tick exceeded two seconds."
-        )
+    )
+    metrics["interpretation"] = (
+        f"Measured dominant phase is {dominant_label} at {dominant_ms:.1f} ms/tick "
+        f"(controller phases excluding advance total {controller_ms:.1f} ms/tick; "
+        f"POST /sim/advance is {advance_ms:.1f} ms/tick). "
+        f"History preload was {history_events} events in {history_seconds:.1f}s "
+        f"({history_rate:.0f} events/s), separate from steady state. "
+        f"{ten_x} I would change: {changes.get(dominant_key, 'profile the largest phase before changing it')}. "
+        f"Steady-state wall time was {metrics['steady_state_minutes']:.1f} min for "
+        f"{metrics['tick_count']} ticks against the 10-minute target "
+        f"({'met' if metrics['target_10_min_met'] else 'not met'})."
+    )
 
     report_path = reports_dir / "public_03_load.md"
     report = _write_report(
