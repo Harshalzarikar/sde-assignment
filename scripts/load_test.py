@@ -26,7 +26,12 @@ INGEST_RE = re.compile(
     r"\[ingest:(?P<label>[^\]]+)\].*?events=(?P<events>\d+)\s+"
     r"events_per_sec=(?P<rate>[0-9.]+)\s+lag=(?P<lag>\S+)"
 )
-TICK_RE = re.compile(r"\[tick\].*?duration=(?P<duration>[0-9.]+)")
+TICK_RE = re.compile(
+    r"\[tick\].*?events=(?P<events>\d+)\s+duration=(?P<duration>[0-9.]+)\s+"
+    r"state=(?P<state>[0-9.]+)\s+advance=(?P<advance>[0-9.]+)\s+"
+    r"ingest=(?P<ingest>[0-9.]+)\s+supervisor=(?P<supervisor>[0-9.]+)\s+"
+    r"detect=(?P<detect>[0-9.]+)\s+governance=(?P<governance>[0-9.]+)"
+)
 
 
 def _free_port() -> int:
@@ -207,9 +212,16 @@ def _lag_text(seconds: object) -> str:
     return "n/a" if seconds is None else f"{float(seconds):.1f} s"
 
 
+def _mean_phase_ms(rows: list[dict[str, object]], key: str) -> float:
+    if not rows:
+        return 0.0
+    return sum(float(row[key]) for row in rows) / len(rows) * 1000.0
+
+
 def _parse_log(path: Path) -> dict[str, object]:
     ingest = []
     tick_durations = []
+    tick_profiles = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         match = INGEST_RE.search(line)
         if match:
@@ -228,6 +240,18 @@ def _parse_log(path: Path) -> dict[str, object]:
         match = TICK_RE.search(line)
         if match:
             tick_durations.append(float(match.group("duration")))
+            tick_profiles.append(
+                {
+                    "events": int(match.group("events")),
+                    "duration": float(match.group("duration")),
+                    "state": float(match.group("state")),
+                    "advance": float(match.group("advance")),
+                    "ingest": float(match.group("ingest")),
+                    "supervisor": float(match.group("supervisor")),
+                    "detect": float(match.group("detect")),
+                    "governance": float(match.group("governance")),
+                }
+            )
     tick_rows = [row for row in ingest if row["label"] == "tick"]
     event_tick_rows = [row for row in tick_rows if int(row["events"]) > 0]
     lag_values = [
@@ -242,6 +266,7 @@ def _parse_log(path: Path) -> dict[str, object]:
         "idle_tick_count": len(tick_rows) - len(event_tick_rows),
         "tick_rates": [float(row["rate"]) for row in tick_rows],
         "tick_durations": tick_durations,
+        "tick_profiles": tick_profiles,
         "max_lag_seconds": max(lag_values) if lag_values else None,
         "final_lag_seconds": lag_values[-1] if lag_values else None,
     }
@@ -276,6 +301,17 @@ def _write_report(
         chunk_file = root / "sim" / str(largest_path)
         if chunk_file.exists():
             largest_bytes = chunk_file.stat().st_size
+    phase_all = metrics.get("phase_all_ms", {})
+    phase_idle = metrics.get("phase_idle_ms", {})
+    controller_keys = ("state", "ingest", "supervisor", "detect", "governance")
+    controller_all = sum(float(phase_all.get(key, 0.0)) for key in controller_keys)
+    controller_idle = sum(float(phase_idle.get(key, 0.0)) for key in controller_keys)
+    other_all = float(phase_all.get("duration", 0.0)) - (
+        controller_all + float(phase_all.get("advance", 0.0))
+    )
+    other_idle = float(phase_idle.get("duration", 0.0)) - (
+        controller_idle + float(phase_idle.get("advance", 0.0))
+    )
     stop_arg = (
         f" --stop-after-minutes {stop_after_minutes}"
         if stop_after_minutes is not None
@@ -317,6 +353,29 @@ def _write_report(
         f"| Peak controller working set | {metrics['peak_memory_mb']:.1f} MB |",
         f"| Final DB size | {metrics['db_size_mb']:.1f} MB |",
         f"| Simulated finish | minute {state.get('sim_minute')} of {state.get('end_minute')} |",
+        "",
+        "## Tick phase breakdown",
+        "",
+        f"Profiled ticks: {metrics['profile_tick_count']} total, "
+        f"{metrics['profile_idle_count']} idle (no events ingested).",
+        "",
+        "| Phase | All ticks mean | Idle ticks mean |",
+        "|---|---|---|",
+        f"| POST /sim/advance | {phase_all.get('advance', 0.0):.2f} ms | "
+        f"{phase_idle.get('advance', 0.0):.2f} ms |",
+        f"| Ingest | {phase_all.get('ingest', 0.0):.2f} ms | "
+        f"{phase_idle.get('ingest', 0.0):.2f} ms |",
+        f"| Detect | {phase_all.get('detect', 0.0):.2f} ms | "
+        f"{phase_idle.get('detect', 0.0):.2f} ms |",
+        f"| Governance | {phase_all.get('governance', 0.0):.2f} ms | "
+        f"{phase_idle.get('governance', 0.0):.2f} ms |",
+        f"| Supervisor edits | {phase_all.get('supervisor', 0.0):.2f} ms | "
+        f"{phase_idle.get('supervisor', 0.0):.2f} ms |",
+        f"| State reads | {phase_all.get('state', 0.0):.2f} ms | "
+        f"{phase_idle.get('state', 0.0):.2f} ms |",
+        f"| Other controller work | {other_all:.2f} ms | {other_idle:.2f} ms |",
+        f"| Full tick | {phase_all.get('duration', 0.0):.2f} ms | "
+        f"{phase_idle.get('duration', 0.0):.2f} ms |",
         "",
         "## Chunk sizes",
         "",
@@ -437,6 +496,17 @@ def main(argv: list[str] | None = None) -> int:
     total_events = sum(int(row["events"]) for row in parsed["ingest"])
     tick_durations = list(parsed["tick_durations"])
     tick_rates = list(parsed["tick_rates"])
+    tick_profiles = list(parsed["tick_profiles"])
+    idle_profiles = [row for row in tick_profiles if int(row["events"]) == 0]
+    phase_keys = (
+        "duration",
+        "state",
+        "advance",
+        "ingest",
+        "supervisor",
+        "detect",
+        "governance",
+    )
     metrics = {
         "total_events": total_events,
         "wall_seconds": wall_seconds,
@@ -453,6 +523,14 @@ def main(argv: list[str] | None = None) -> int:
         "final_lag_seconds": parsed["final_lag_seconds"],
         "peak_memory_mb": peak_mb or 0.0,
         "db_size_mb": _db_size(db_path) / (1024.0 * 1024.0),
+        "profile_tick_count": len(tick_profiles),
+        "profile_idle_count": len(idle_profiles),
+        "phase_all_ms": {
+            key: _mean_phase_ms(tick_profiles, key) for key in phase_keys
+        },
+        "phase_idle_ms": {
+            key: _mean_phase_ms(idle_profiles, key) for key in phase_keys
+        },
     }
     lag = metrics["max_lag_seconds"]
     slow = metrics["slowest_tick_seconds"]

@@ -144,26 +144,37 @@ def run(
     governance.reconcile_all(sim_ts=state.get("ts"))
 
     while True:
+        tick_started = time.perf_counter()
+        state_started = time.perf_counter()
         state = client.get_state()
+        state_elapsed = time.perf_counter() - state_started
         if state.get("finished"):
             print(f"[done] scenario finished at {state.get('ts')}", flush=True)
             break
 
+        advance_started = time.perf_counter()
         try:
             result = client.advance(tick)
         except ScenarioFinished:
             print("[done] scenario finished (409)", flush=True)
             break
+        advance_elapsed = time.perf_counter() - advance_started
 
-        ingested, elapsed = _timed_ingest(client, store, "tick")
+        ingested, ingest_elapsed = _timed_ingest(client, store, "tick")
+        state_started = time.perf_counter()
         state = client.get_state()
-        _log_ingest("tick", ingested, elapsed, state, store)
+        state_elapsed += time.perf_counter() - state_started
+        _log_ingest("tick", ingested, ingest_elapsed, state, store)
 
         if not live_range_seen and store.get_cursor("events") is not None:
             _report_event_ranges(client, store)
             live_range_seen = True
 
+        supervisor_started = time.perf_counter()
         governance.process_supervisor_edits(sim_ts=state.get("ts"))
+        supervisor_elapsed = time.perf_counter() - supervisor_started
+
+        detect_started = time.perf_counter()
         decide(
             client,
             store,
@@ -172,10 +183,24 @@ def run(
             governance=governance,
             detector=detector,
         )
+        detect_elapsed = time.perf_counter() - detect_started
+
+        governance_started = time.perf_counter()
         governance.process(sim_ts=state.get("ts"))
+        governance_elapsed = time.perf_counter() - governance_started
 
         if int(state.get("sim_minute", 0)) % 60 == 0:
             _hourly_summary(store, workflows, state.get("ts"))
+
+        tick_elapsed = time.perf_counter() - tick_started
+        print(
+            f"[tick] sim={state.get('ts')} minute={state.get('sim_minute')} "
+            f"events={sum(ingested.values())} duration={tick_elapsed:.6f} "
+            f"state={state_elapsed:.6f} advance={advance_elapsed:.6f} "
+            f"ingest={ingest_elapsed:.6f} supervisor={supervisor_elapsed:.6f} "
+            f"detect={detect_elapsed:.6f} governance={governance_elapsed:.6f}",
+            flush=True,
+        )
 
         if result.get("finished") or state.get("finished"):
             print(f"[done] scenario finished at {state.get('ts')}", flush=True)
