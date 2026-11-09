@@ -52,6 +52,8 @@ class Store:
                 workflow_id TEXT,
                 payload TEXT
             );
+            CREATE INDEX IF NOT EXISTS events_type_event_id
+                ON events (type, event_id);
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sim_ts TEXT,
@@ -105,35 +107,45 @@ class Store:
         if kind not in ("events", "history"):
             raise ValueError(f"unknown chunk kind: {kind!r}")
 
-        with self.conn:
-            for event in events:
-                try:
-                    event_id = event["event_id"]
-                except (KeyError, TypeError) as exc:
-                    raise ValueError("event is missing event_id") from exc
-                inserted = self.conn.execute(
-                    "INSERT OR IGNORE INTO events (event_id, type, ts, workflow_id, payload) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        int(event_id),
-                        event.get("type"),
-                        event.get("ts"),
-                        event.get("workflow_id"),
-                        json.dumps(event, ensure_ascii=False, sort_keys=True),
-                    ),
-                )
-                if inserted.rowcount == 1 and event.get("type") == "call":
-                    self._upsert_counts(event)
+        def flush(batch: list[dict[str, Any]], final: bool) -> None:
+            with self.conn:
+                for event in batch:
+                    try:
+                        event_id = event["event_id"]
+                    except (KeyError, TypeError) as exc:
+                        raise ValueError("event is missing event_id") from exc
+                    inserted = self.conn.execute(
+                        "INSERT OR IGNORE INTO events "
+                        "(event_id, type, ts, workflow_id, payload) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            int(event_id),
+                            event.get("type"),
+                            event.get("ts"),
+                            event.get("workflow_id"),
+                            json.dumps(event, ensure_ascii=False, sort_keys=True),
+                        ),
+                    )
+                    if inserted.rowcount == 1 and event.get("type") == "call":
+                        self._upsert_counts(event)
+                if final:
+                    row = self.conn.execute(
+                        'SELECT value FROM "cursor" WHERE key = ?', (kind,)
+                    ).fetchone()
+                    if row is None or int(chunk_no) > int(row[0]):
+                        self.conn.execute(
+                            'INSERT INTO "cursor" (key, value) VALUES (?, ?) '
+                            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                            (kind, int(chunk_no)),
+                        )
 
-            row = self.conn.execute(
-                'SELECT value FROM "cursor" WHERE key = ?', (kind,)
-            ).fetchone()
-            if row is None or int(chunk_no) > int(row[0]):
-                self.conn.execute(
-                    'INSERT INTO "cursor" (key, value) VALUES (?, ?) '
-                    'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                    (kind, int(chunk_no)),
-                )
+        batch: list[dict[str, Any]] = []
+        for event in events:
+            batch.append(event)
+            if len(batch) >= 10_000:
+                flush(batch, False)
+                batch = []
+        flush(batch, True)
 
     @staticmethod
     def _hour_bucket(ts: Any) -> str:
