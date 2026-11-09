@@ -3,13 +3,13 @@
 ## Commands
 
 ```
-python scripts/crash_test.py C:\Users\Asus\Documents\wellfound_assignment\scenarios\public_02_incidents.yaml
-python -m sim serve --scenario C:\Users\Asus\Documents\wellfound_assignment\scenarios\public_02_incidents.yaml --run-dir <run-dir> --port <free-port>
+python scripts/crash_test.py scenarios/public_02_incidents.yaml
+python -m sim serve --scenario scenarios/public_02_incidents.yaml --run-dir <run-dir> --port <free-port>
 python -m controller.main http://127.0.0.1:<port> --db <CONTROLLER_DB>
 CONTROLLER_CRASH_AT=<point> python -m controller.main ...
 ```
 
-Artifacts: `C:\Users\Asus\Documents\wellfound_assignment\runs\crash_20261108T071138Z`
+Artifacts: `runs/crash_20261108T071138Z` (gitignored)
 
 ## Crash cycles
 

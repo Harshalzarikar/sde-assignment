@@ -68,13 +68,13 @@ Principle: one incident loop done end-to-end under governance, load and crash te
 
 ### 03 — Kabir Menon, Platform & SRE lead
 
-**Accepted:** kill/restart safety, idempotency, actionable alerts, no new server to operate, one-day load target, visibility into ingest lag and decisions.
+**Accepted:** kill/restart safety, idempotency, actionable alerts, no new server to operate, steady-state one-day load target, visibility into ingest lag and decisions.
 
 **Pushed back:** I used embedded SQLite, not Postgres. It is a single file with no server to operate, but I would not run it as production HA storage. I do not have a status command or paging integration, so I will not claim one. The load test covered one simulated day, not all five.
 
 **Wrong against policy:** no factual claim was contradicted; the production-infrastructure concern was correct.
 
-**Reply:** Kabir — the kill/restart test is in `reports/crash_recovery.md`: kills mid-ingest, after intent and after the API call, all exit 137, then the run finishes with identical cursors, counts, proposal digest and applied versions, no duplicate IDs, and the pending approval intact. I used SQLite because it is a single embedded file with no server to operate, but I would not run it as production HA storage; the first move is Postgres on a persistent volume. I do not have a status command or paging integration yet.
+**Reply:** Kabir — the kill/restart test is in `reports/crash_recovery.md`: kills mid-ingest, after intent and after the API call, all exit 137, then the run finishes with identical cursors, counts, proposal digest and applied versions, no duplicate IDs, and the pending approval intact. I used SQLite because it is a single embedded file with no server to operate, but I would not run it as production HA storage; the first move is Postgres on a persistent volume. Steady state is 2.2 min for 96 ticks; including the one-time 600.2 s history preload, the one-day total is 12.2 min, so I do not claim the literal 10-minute end-to-end target. I do not have a status command or paging integration yet.
 
 ### 04 — Anita Desai, Operations Supervisor, Kestrel Finance
 
@@ -185,7 +185,7 @@ D0 = 2027-01-04, so D1 = 2027-01-05 and D2 = 2027-01-06.
 Measured on `public_03_load`, one simulated day of five (`--stop-after-minutes 1440`), fresh simulator and DB:
 
 - Simulator startup 231.5 s; history preload 5,537,379 events in 600.2 s (9,226 events/s).
-- Controller wall time including preload 732.6 s. Steady-state: 96 ticks in 131.8 s (2.20 min), so the one-day 10-minute target was met.
+- Controller wall time including preload 732.6 s (12.2 min). Steady-state: 96 ticks in 131.8 s (2.20 min). The 10-minute target is met for steady-state live-day processing; including the one-time history preload, the one-day total is 12.2 min, so the literal end-to-end 10-minute target is not met.
 - Live events 840,012; ingest mean 10,697 events/s, peak 35,619 events/s.
 - Mean tick 1,372.86 ms; slowest 7,835.89 ms.
 - Ingest lag: max 900 s, final 480 s. This is the normal age of the newest event after a 15-minute advance, not extra backlog.
@@ -320,7 +320,7 @@ The caller-ID fix helped `ks_cancel` pickup and conclusion; ALL pickup/conclusio
 - Expired proposals are marked expired, but the deterministic ID can return the expired row instead of re-queueing with fresh data.
 - `impact_score` is constant 0.08; `affected_leads` is recent dials, not unique leads; `dry_run` is evidence metadata.
 - No cohorts, experiments, winner promotion, decay rollback, per-person call time, supervisor view, metrics endpoint or paging.
-- False-positive rate is nominal, not measured. The load run covered one day of five; at 10× ingest is the first extrapolated bottleneck.
+- False-positive rate is nominal, not measured. The load run covered one day of five; including the one-time history preload, that day took 12.2 min versus the 10-minute ask (steady state was 2.2 min). At 10× ingest is the first extrapolated bottleneck.
 - SQLite is not production HA storage; 3.8 GB/day and 1.68 GB peak memory need retention, compaction and a Postgres plan.
 - ALL engagement is -0.1%, so the one successful change is not a broad engagement win.
 
