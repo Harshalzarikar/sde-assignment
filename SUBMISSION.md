@@ -222,7 +222,7 @@ ORDER BY id;
 
 The proposal row is `prop_5236d...`, `applied`, base version 1, approval `apr_00001`, created 16:00, updated 17:00. The simulator's `config_changed` event at 17:00 has `actor: controller_approved`, `approval_id: apr_00001`, `changed_dims: ['caller_id']`, version 2. In the same probe, caller counts after 17:00 were `D1` 612 dials / 154 connected and `D2` 88 dials / 9 connected.
 
-Page on: simulator unreachable, repeated controller crashes, ingest lag beyond two ticks, pending approval within 15 minutes of `apply_by`, repeated 5xx, and a simulator reset. Do not page on: a single-call pickup blip, a daily "no action" check, a rejected/expired proposal, or an unrelated supervisor edit.
+**Proposed paging rules (not implemented).** Nothing in the codebase pages anyone. I would page on: simulator unreachable, repeated controller crashes, ingest lag beyond two ticks, pending approval within 15 minutes of `apply_by`, repeated 5xx, and a simulator reset. I would not page on: a single-call pickup blip, a daily "no action" check, a rejected/expired proposal, or an unrelated supervisor edit.
 
 ## 11. Results
 
