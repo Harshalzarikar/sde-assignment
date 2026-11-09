@@ -178,8 +178,11 @@ def _run_controller(
     url: str,
     db_path: Path,
     log_path: Path,
+    stop_after_minutes: int | None = None,
 ) -> tuple[int, float, float | None]:
     command = [python, "-m", "controller.main", url, "--db", str(db_path)]
+    if stop_after_minutes is not None:
+        command.extend(["--stop-after-minutes", str(stop_after_minutes)])
     started = time.perf_counter()
     peak_mb = 0.0
     with log_path.open("w", encoding="utf-8") as log:
@@ -258,6 +261,7 @@ def _write_report(
     metrics: dict[str, object],
     state: dict[str, object],
     chunks: dict[str, list[dict[str, object]]],
+    stop_after_minutes: int | None = None,
 ) -> str:
     chunk_items = [
         (int(chunk["events"]), chunk_kind, int(chunk["chunk"]), chunk)
@@ -272,18 +276,28 @@ def _write_report(
         chunk_file = root / "sim" / str(largest_path)
         if chunk_file.exists():
             largest_bytes = chunk_file.stat().st_size
+    stop_arg = (
+        f" --stop-after-minutes {stop_after_minutes}"
+        if stop_after_minutes is not None
+        else ""
+    )
+    stop_note = (
+        f"Stopped early after {stop_after_minutes} simulated minutes."
+        if stop_after_minutes is not None
+        else "No early stop."
+    )
     lines = [
         f"# Load report — {scenario.stem}",
         "",
         "## Exact commands",
         "",
         "```",
-        f"python scripts/load_test.py {scenario} --work-root {root.parent}",
+        f"python scripts/load_test.py {scenario} --work-root {root.parent}{stop_arg}",
         f"python -m sim serve --scenario {scenario} --run-dir {root / 'sim'} --port <free-port>",
-        f"python -m controller.main http://127.0.0.1:<port> --db {root / 'controller.db'}",
+        f"python -m controller.main http://127.0.0.1:<port> --db {root / 'controller.db'}{stop_arg}",
         "```",
         "",
-        "No baseline run and no early stop. One fresh simulator and one fresh controller DB.",
+        f"No baseline run; {stop_note} One fresh simulator and one fresh controller DB.",
         "",
         "## Controller load",
         "",
@@ -337,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
         default=str(ROOT / "runs"),
         help="directory for simulator and controller run artifacts",
     )
+    parser.add_argument(
+        "--stop-after-minutes",
+        type=int,
+        default=None,
+        help="stop the controller at this simulated minute (testing only)",
+    )
     args = parser.parse_args(argv)
     scenario = Path(args.scenario_yaml)
     if not scenario.is_absolute():
@@ -389,7 +409,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         print("[controller] running")
         code, wall_seconds, peak_mb = _run_controller(
-            python, url, db_path, log_path
+            python,
+            url,
+            db_path,
+            log_path,
+            stop_after_minutes=args.stop_after_minutes,
         )
         if code != 0:
             raise SystemExit(f"controller failed: {code}")
@@ -448,7 +472,14 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     report_path = reports_dir / "public_03_load.md"
-    report = _write_report(scenario, root, metrics, state, chunks)
+    report = _write_report(
+        scenario,
+        root,
+        metrics,
+        state,
+        chunks,
+        stop_after_minutes=args.stop_after_minutes,
+    )
     report_path.write_text(report, encoding="utf-8")
     print(
         json.dumps(
