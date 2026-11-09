@@ -132,6 +132,22 @@ def _env() -> dict[str, str]:
 if os.name == "nt":
     import ctypes.wintypes
 
+    _kernel32 = ctypes.windll.kernel32
+    _psapi = ctypes.windll.psapi
+    _kernel32.OpenProcess.argtypes = [
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.DWORD,
+    ]
+    _kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+    ]
+    _kernel32.CreateToolhelp32Snapshot.restype = ctypes.wintypes.HANDLE
+
     class _ProcessMemoryCounters(ctypes.Structure):
         _fields_ = [
             ("cb", ctypes.wintypes.DWORD),
@@ -145,6 +161,27 @@ if os.name == "nt":
             ("PagefileUsage", ctypes.c_size_t),
             ("PeakPagefileUsage", ctypes.c_size_t),
         ]
+
+    class _ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.wintypes.DWORD),
+            ("cntUsage", ctypes.wintypes.DWORD),
+            ("th32ProcessID", ctypes.wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.wintypes.DWORD),
+            ("cntThreads", ctypes.wintypes.DWORD),
+            ("th32ParentProcessID", ctypes.wintypes.DWORD),
+            ("pcPriClassBase", ctypes.wintypes.LONG),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    _psapi.GetProcessMemoryInfo.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.POINTER(_ProcessMemoryCounters),
+        ctypes.wintypes.DWORD,
+    ]
+    _psapi.GetProcessMemoryInfo.restype = ctypes.wintypes.BOOL
 else:
     _ProcessMemoryCounters = None
 
@@ -153,7 +190,7 @@ def _rss_mb(pid: int) -> float | None:
     if os.name == "nt":
         process_query_information = 0x0400
         process_vm_read = 0x0010
-        handle = ctypes.windll.kernel32.OpenProcess(
+        handle = _kernel32.OpenProcess(
             process_query_information | process_vm_read, False, int(pid)
         )
         if not handle:
@@ -161,14 +198,14 @@ def _rss_mb(pid: int) -> float | None:
         try:
             counters = _ProcessMemoryCounters()
             counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
-            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            ok = _psapi.GetProcessMemoryInfo(
                 handle, ctypes.byref(counters), counters.cb
             )
             if not ok:
                 return None
             return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
     status = Path(f"/proc/{int(pid)}/status")
     if not status.exists():
         return None
@@ -176,6 +213,43 @@ def _rss_mb(pid: int) -> float | None:
         if line.startswith("VmRSS:"):
             return float(line.split()[1]) / 1024.0
     return None
+
+
+def _process_tree(pid: int) -> list[int]:
+    if os.name != "nt":
+        return [int(pid)]
+    snapshot = _kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.wintypes.HANDLE(-1).value:
+        return [int(pid)]
+    entries: list[tuple[int, int]] = []
+    try:
+        entry = _ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+        ok = _kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            entries.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+            ok = _kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snapshot)
+    children: dict[int, list[int]] = {}
+    for child, parent in entries:
+        children.setdefault(parent, []).append(child)
+    found: list[int] = []
+    pending = [int(pid)]
+    while pending:
+        current = pending.pop()
+        found.append(current)
+        pending.extend(children.get(current, []))
+    return found
+
+
+def _tree_peak_mb(pid: int) -> float | None:
+    values = [
+        value
+        for value in (_rss_mb(item) for item in _process_tree(pid))
+        if value is not None
+    ]
+    return max(values) if values else None
 
 
 def _run_controller(
@@ -199,7 +273,7 @@ def _run_controller(
             stderr=subprocess.STDOUT,
         )
         while process.poll() is None:
-            value = _rss_mb(process.pid)
+            value = _tree_peak_mb(process.pid)
             if value is not None:
                 peak_mb = max(peak_mb, value)
             time.sleep(0.1)
