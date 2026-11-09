@@ -58,13 +58,13 @@ Principle: one incident loop done end-to-end under governance, load and crash te
 
 ### 02 — Meera Iyer, Head of Compliance, Northwind Life
 
-**Accepted:** no customer-facing change without a named Northwind approval; script changes need validation evidence; every change is auditable to variant, approval and timestamp; operational settings stay inside the signed policy. The memo's approver hours match the API: 10:00–19:00, KYC 10:00–18:00.
+**Accepted:** no customer-facing change without a named Northwind approval; script changes need validation evidence; every change is auditable to variant, approval and timestamp; an ingested call can be traced from its `variant` to the live `config_changed` version, applied proposal and approval in my store; operational settings stay inside the signed policy. The memo's approver hours match the API: 10:00–19:00, KYC 10:00–18:00.
 
 **Pushed back:** the memo assumes a weekly summary exists; it does not. I did not make every operational setting require a named human approval, because caller-ID rotation and timing are delegated by policy. KYC auto-apply stays disabled. Requests are queued outside approver hours rather than sent at night.
 
 **Wrong against policy:** the weekly summary is not a built product surface.
 
-**Reply:** Meera — accepted: no customer-facing change without a named Northwind approval; script changes carry validation evidence; every change is auditable to variant, approval and timestamp, and I can answer an auditor query from my store. Caller-ID rotation and timing stay inside the signed policy, and KYC auto-apply remains disabled. I have not built the weekly summary yet; that is a gap. Requests are queued outside your approver hours rather than sent at night.
+**Reply:** Meera — accepted: no customer-facing change without a named Northwind approval; script changes carry validation evidence; every change is auditable to variant, approval and timestamp, and I can trace an ingested call from the events table to the live config version, proposal and approval in my store. Caller-ID rotation and timing stay inside the signed policy, and KYC auto-apply remains disabled. I have not built the weekly summary yet; that is a gap. Requests are queued outside your approver hours rather than sent at night.
 
 ### 03 — Kabir Menon, Platform & SRE lead
 
@@ -223,6 +223,56 @@ ORDER BY id;
 ```
 
 The proposal row is `prop_5236d...`, `applied`, base version 1, approval `apr_00001`, created 16:00, updated 17:00. The simulator's `config_changed` event at 17:00 has `actor: controller_approved`, `approval_id: apr_00001`, `changed_dims: ['caller_id']`, version 2. In the same probe, caller counts after 17:00 were `D1` 612 dials / 154 connected and `D2` 88 dials / 9 connected.
+
+**Call-level trace.** The store can answer the auditor question for an ingested call: which variant was heard, and which config version, proposal and approval made it live. From a fresh `public_02` run, call event `225111` at `2027-01-06T17:11:00+05:30` resolves with this exact query:
+
+```sql
+SELECT
+  c.event_id AS call_event_id,
+  c.ts AS call_ts,
+  json_extract(c.payload, '$.tenant_id') AS tenant_id,
+  json_extract(c.payload, '$.person_id') AS person_id,
+  json_extract(c.payload, '$.lead_id') AS lead_id,
+  json_extract(c.payload, '$.variant.caller_id') AS caller_id,
+  json_extract(c.payload, '$.variant.welcome_message') AS welcome_message,
+  json_extract(c.payload, '$.variant.voice') AS voice,
+  json_extract(c.payload, '$.variant.prompt_version') AS prompt_version,
+  json_extract(c.payload, '$.config_version') AS call_config_version,
+  json_extract(g.payload, '$.version') AS live_config_version,
+  json_extract(g.payload, '$.approval_id') AS approval_id,
+  json_extract(g.payload, '$.proposal_id') AS proposal_id,
+  p.status AS proposal_status,
+  p.created_ts AS proposal_created_ts,
+  p.updated_ts AS proposal_updated_ts,
+  a.sim_ts AS audit_ts,
+  a.kind AS audit_kind,
+  a.reason AS audit_reason
+FROM events c
+JOIN events g
+  ON g.type = 'config_changed'
+ AND g.workflow_id = c.workflow_id
+ AND g.event_id = (
+    SELECT g2.event_id FROM events g2
+    WHERE g2.type = 'config_changed'
+      AND g2.workflow_id = c.workflow_id
+      AND g2.ts <= c.ts
+    ORDER BY g2.event_id DESC LIMIT 1
+ )
+JOIN proposals p
+  ON p.proposal_id = json_extract(g.payload, '$.proposal_id')
+JOIN audit a
+  ON a.workflow_id = c.workflow_id
+ AND a.kind = 'proposal_applied'
+ AND a.sim_ts = g.ts
+WHERE c.type = 'call'
+  AND c.event_id = 225111;
+```
+
+```text
+call_event_id=225111 | call_ts=2027-01-06T17:11:00+05:30 | tenant=kestrel_finance | person=ks_cancel:p0001768 | lead=ks_cancel:l00022617 | variant=D2/W1/V1/P1 | call_config_version=2 | live_config_version=2 | approval=apr_00001 | proposal=prop_5236d76e... | proposal_status=applied | proposal_created=2027-01-06T16:00:00+05:30 | proposal_updated=2027-01-06T17:00:00+05:30 | audit=2027-01-06T17:00:00+05:30 proposal_applied "approved config applied"
+```
+
+The proposal was created at 16:00 after `caller_id_degraded` for `D2` and applied at 17:00; the `config_changed` event at 17:00 has `changed_dims: ['caller_id']`. The call at 17:11 therefore heard `D2/W1/V1/P1` because the approved caller-ID repair was live.
 
 **Proposed paging rules (not implemented).** Nothing in the codebase pages anyone. I would page on: simulator unreachable, repeated controller crashes, ingest lag beyond two ticks, pending approval within 15 minutes of `apply_by`, repeated 5xx, and a simulator reset. I would not page on: a single-call pickup blip, a daily "no action" check, a rejected/expired proposal, or an unrelated supervisor edit.
 
