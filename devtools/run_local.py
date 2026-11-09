@@ -64,7 +64,7 @@ def run_controller(url: str, db: Path, crash_after: float | None, crash_at_minut
 
 
 def check_counts(db: Path, run_dir: Path) -> bool:
-    truth = json.loads((run_dir / "_truth" / "aggregates.json").read_text())
+    truth = json.loads((run_dir / "_truth" / "aggregates.json").read_text(encoding="utf-8"))
     want = defaultdict(lambda: [0, 0, 0])
     for d in truth["days"]:
         t = want[(d["workflow_id"], d["day"])]
@@ -112,7 +112,7 @@ def main():
 
     report = ROOT / "reports" / f"{a.name}.md"
     report.parent.mkdir(exist_ok=True)
-    report.write_text(to_markdown(grade(str(run_dir), str(base_dir))))
+    report.write_text(to_markdown(grade(str(run_dir), str(base_dir))), encoding="utf-8")
     print(f"grade report: {report.relative_to(ROOT)}")
     ok = check_counts(db, run_dir)
     print("count check:", "MATCH - the notebook agrees exactly with the simulator" if ok else "MISMATCH")

@@ -1,9 +1,13 @@
 """The main loop: move simulated time forward, read what happened, decide what to change."""
 import datetime as dt
 import os
-import resource
 import sys
 import time
+
+try:
+    import resource
+except ImportError:  # Windows has no resource module; RSS is reported as 0.0 there
+    resource = None
 
 from .api import Api
 from .callerid import CallerIdManager
@@ -21,6 +25,8 @@ STOP_AT_ENV = "CONTROLLER_STOP_AT_MINUTE"  # test-only: stop cleanly there (load
 
 
 def peak_rss_mb() -> float:
+    if resource is None:
+        return 0.0
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return r / (1024 * 1024) if sys.platform == "darwin" else r / 1024
 
