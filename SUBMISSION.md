@@ -188,6 +188,7 @@ Measured on `public_03_load`, one simulated day of five (`--stop-after-minutes 1
 - Controller wall time including preload 732.6 s (12.2 min). Steady-state: 96 ticks in 131.8 s (2.20 min). The 10-minute target is met for steady-state live-day processing; including the one-time history preload, the one-day total is 12.2 min, so the literal end-to-end 10-minute target is not met.
 - Live events 840,012; ingest mean 10,697 events/s, peak 35,619 events/s.
 - Mean tick 1,372.86 ms; slowest 7,835.89 ms.
+- End-to-end decision lag is bounded by one tick: mean 1.37 s, slowest 7.84 s. In simulated time, the newest event is at most 900 s old when inspected; this is the normal age after a 15-minute advance, not extra controller backlog.
 - Ingest lag: max 900 s, final 480 s. This is the normal age of the newest event after a 15-minute advance, not extra backlog.
 - Peak controller working set 1,683.7 MB (max RSS in the controller process tree, not the simulator).
 - Final DB 3,801.8 MB; WAL/SHM 0.0 MB.
@@ -280,21 +281,21 @@ The proposal was created at 16:00 after `caller_id_degraded` for `D2` and applie
 
 `public_01` — zero changes:
 
-| workflow | conclusion | Δ | pickup | Δ | engagement | Δ | hallucinated (base) |
-|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.333 | +0.0% | 0.238 | +0.0% | 0.491 | +0.0% | 47 (47) |
-| nw_kyc | 0.364 | +0.0% | 0.242 | +0.0% | 0.591 | +0.0% | 21 (21) |
-| nw_renewal | 0.420 | +0.0% | 0.263 | +0.0% | 0.546 | +0.0% | 42 (42) |
-| ALL | 0.368 | +0.0% | 0.248 | +0.0% | 0.530 | +0.0% | 110 (110) |
+| workflow | conclusion | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated (base) |
+|---|---|---|---|---|---|---|---|---|
+| ks_cancel | 0.333 | +0.0% | 0.238 | +0.0% | 0.491 | +0.0% | 0% | 47 (47) |
+| nw_kyc | 0.364 | +0.0% | 0.242 | +0.0% | 0.591 | +0.0% | 0% | 21 (21) |
+| nw_renewal | 0.420 | +0.0% | 0.263 | +0.0% | 0.546 | +0.0% | 0% | 42 (42) |
+| ALL | 0.368 | +0.0% | 0.248 | +0.0% | 0.530 | +0.0% | 0% | 110 (110) |
 
 `public_02` — one beneficial change:
 
-| workflow | conclusion | Δ | pickup | Δ | engagement | Δ | hallucinated (base) |
-|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.275 | +11.0% | 0.201 | +9.5% | 0.477 | +0.2% | 362 (330) |
-| nw_kyc | 0.378 | +0.9% | 0.244 | +0.8% | 0.592 | -0.0% | 34 (31) |
-| nw_renewal | 0.432 | +1.2% | 0.264 | +0.8% | 0.550 | +0.3% | 79 (55) |
-| ALL | 0.349 | +4.4% | 0.231 | +4.1% | 0.529 | -0.1% | 475 (416) |
+| workflow | conclusion | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated (base) |
+|---|---|---|---|---|---|---|---|---|
+| ks_cancel | 0.275 | +11.0% | 0.201 | +9.5% | 0.477 | +0.2% | 0% | 362 (330) |
+| nw_kyc | 0.378 | +0.9% | 0.244 | +0.8% | 0.592 | -0.0% | 0% | 34 (31) |
+| nw_renewal | 0.432 | +1.2% | 0.264 | +0.8% | 0.550 | +0.3% | 5% | 79 (55) |
+| ALL | 0.349 | +4.4% | 0.231 | +4.1% | 0.529 | -0.1% | 3% | 475 (416) |
 
 The caller-ID fix helped `ks_cancel` pickup and conclusion; ALL pickup/conclusion moved with it. It did not improve ALL engagement (-0.1%) and did not repair the supervisor prompt/voice edits; hallucinated calls rose 416 → 475. The `nw_renewal` increase (55 → 79) is in the workflow with the D5 voice edit, consistent with an unrepaired supervisor change. I would add hallucination repair and judge caller-ID repairs against an engagement guardrail, not pickup alone.
 
